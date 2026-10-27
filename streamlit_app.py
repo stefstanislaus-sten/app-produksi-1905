@@ -748,13 +748,17 @@ def prov_prepare(df: pd.DataFrame):
     df = df.reset_index(drop=True)
 
     def aid(i):
+        """ID RTUP: UUID tepat setelah 'assignment-detail/', bukan UUID survei."""
         lk = df.at[i, M["link"]] if "link" in M else ""
-        m = UUID_RE.search(lk)
+        m = re.search(r"assignment-detail/(" + UUID_RE.pattern + ")", lk, re.I)
         if m:
-            return m.group(0).lower()
+            return m.group(1).lower()
+        cand = [u.lower() for u in UUID_RE.findall(lk) if u.lower() != DEFAULT_SURVEY]
+        if cand:
+            return cand[0]
         if lk:
             return lk
-        return "|".join(df.at[i, M[k]] for k in ("krt", "sls") if k in M) or f"baris{i}"
+        return "|".join(df.at[i, M[k]] for k in ("krt", "sls", "desa") if k in M) or f"baris{i}"
 
     df["_aid"] = [aid(i) for i in df.index]
     df["_kode"] = df[M["kode"]].map(norm_kode) if "kode" in M else ""
@@ -786,7 +790,8 @@ def render_prov_page():
         st.markdown("**📝 Catatan standar**")
         std = st.text_input("Catatan standar", value=DEFAULT_STD, key="prov_std",
                             help="Contoh: Sesuai Kondisi Lapangan dan Penuturan Responden")
-        mode = st.radio("Isi penjelasan otomatis dengan", PROV_MODES, key="prov_mode")
+        # Pilihan "Isi penjelasan otomatis dengan" kini ada di tab Mode per RTUP (key: prov_mode)
+        mode = ss.get("prov_mode", PROV_MODES[0])
         with st.expander("🧩 Template catatan default"):
             st.markdown("**Sesuai Kondisi Lapangan**")
             tpl_no = st.text_area("Template tanpa nilai", value=TPL_NO, key="prov_tpl_no", height=120)
@@ -816,6 +821,12 @@ def render_prov_page():
         if not t:
             return auto(r, stt)
         return auto(r, stt) if t in {auto(r, x) for x in STATUS_OPTS[1:]} else t
+
+    def on_status(i, kst, ktx):
+        """Callback: saat justifikasi diganti, penjelasan langsung disesuaikan (tanpa menimpa teks buatan sendiri)."""
+        s_ = ss[kst]
+        if s_ != STATUS_PLACEHOLDER:
+            ss[ktx] = sync_text(ss.prov_df.loc[i], s_, ss.get(ktx, ""))
 
     up = st.file_uploader("Unggah template provinsi (TXT / TSV / CSV / XLSX)", type=["txt", "tsv", "csv", "xlsx", "xls"], key=f"prov_up_{ss.prov_upv}")
     with st.expander("…atau tempel langsung dari Excel (termasuk baris judul kolom)"):
@@ -898,7 +909,8 @@ def render_prov_page():
 
     # ---------------- MODE TABEL
     with t_tab:
-        st.caption(f"{len(sub):,} baris tampil. Pilih **Justifikasi** dan isi **Penjelasan**, lalu klik Simpan.")
+        st.caption(f"{len(sub):,} baris tampil. Pilih **Justifikasi** dan isi **Penjelasan**, lalu klik Simpan. "
+                   "Cara pengisian penjelasan otomatis diatur di tab *Mode per RTUP*.")
         with st.expander("👁️ Pratinjau catatan default (3 baris pertama pada filter)"):
             for i in sub.index[:3]:
                 st.caption(f"{df.at[i, '_kode']} · {get(df.loc[i], 'krt')}")
@@ -908,7 +920,7 @@ def render_prov_page():
                 st.code(auto(df.loc[i], "Diperbaiki") or "(kosong)", language=None)
         b1, b2, b3 = st.columns([2, 2, 1])
         bulk = b1.selectbox("Isi massal baris terfilter yang belum diisi", STATUS_OPTS[1:], index=1, key=f"bulk_{ver}")
-        b2.caption("Penjelasan diisi sesuai mode otomatis di sidebar (default: template catatan). Periksa dulu sebelum dipakai.")
+        b2.caption("Penjelasan diisi sesuai mode otomatis (default: template catatan). Periksa dulu sebelum dipakai.")
         if b3.button("Terapkan", key=f"bulkb_{ver}"):
             n = 0
             for i in sub.index:
@@ -962,33 +974,42 @@ def render_prov_page():
 
     # ---------------- MODE PER RTUP
     with t_rt:
+        st.selectbox(
+            "Isi penjelasan otomatis dengan", PROV_MODES, key="prov_mode",
+            help="Berlaku saat justifikasi dipilih: penjelasan langsung terisi default sesuai justifikasi "
+                 "(Diperbaiki / Sesuai Kondisi Lapangan). Penjelasan yang sudah Anda ubah sendiri tidak ditimpa.")
         groups = {a: g.index.tolist() for a, g in sub.groupby("_aid", sort=False)}
         if not groups:
             st.info("Tidak ada RTUP pada filter ini.")
         else:
             def lbl(a):
-                ids = groups[a]
-                d = sum(1 for i in ids if stat(i))
-                r0 = df.loc[ids[0]]
-                return f"{'✅' if d == len(ids) else '⏳'} {get(r0, 'krt') or a} · {get(r0, 'desa')} · {len(ids)} flag ({d} selesai)"
+                ids_ = groups[a]
+                d = sum(1 for i in ids_ if stat(i))
+                r0_ = df.loc[ids_[0]]
+                return f"{'✅' if d == len(ids_) else '⏳'} {get(r0_, 'krt') or a} · {get(r0_, 'desa')} · {len(ids_)} flag ({d} selesai)"
 
             sel = st.selectbox("Pilih RTUP (ketik untuk mencari)", list(groups), format_func=lbl, key=f"prsel_{ver}")
             ids = groups[sel]
             r0 = df.loc[ids[0]]
+            all_ids = df.index[df["_aid"] == sel].tolist()      # hanya baris milik RTUP terpilih
             st.markdown(
                 f"**{get(r0, 'krt')}** — {get(r0, 'kab')} / {get(r0, 'kec')} / {get(r0, 'desa')} / {get(r0, 'sls')} "
                 f"· ART: {get(r0, 'jml_art')} · PPL: {get(r0, 'ppl')} · PML: {get(r0, 'pml')}"
             )
+            if "krt" in M and df.loc[all_ids, M["krt"]].nunique() > 1:
+                st.warning("Beberapa nama KRT berbeda terbaca sebagai satu RTUP. Periksa kolom Link pada template "
+                           "sebelum memakai 'Terapkan ke semua'.")
             if get(r0, "link").startswith("http"):
                 lb1, lb2, _ = st.columns([1, 1, 2])
                 lb1.link_button("✏️ Buka mode edit di FASIH SM", edit_link(get(r0, "link"), survey_id), type="primary")
                 lb2.link_button("🔗 Buka detail", get(r0, "link"))
-            all_ids = df.index[df["_aid"] == sel].tolist()
+
             st.markdown("**Terapkan justifikasi ke semua flag pada RTUP ini**")
+            st.caption(f"Hanya berlaku untuk RTUP terpilih ({len(all_ids)} flag), bukan seluruh baris template.")
             ap1, ap2, ap3 = st.columns([2, 2, 1])
             ap_st = ap1.selectbox("Pilih justifikasi", STATUS_OPTS[1:], index=1, key=f"aps_{sel}_{ver}")
             ap_ow = ap2.checkbox("Ganti juga flag yang sudah terisi", value=True, key=f"apo_{sel}_{ver}",
-                                 help="Penjelasan yang Anda tulis sendiri dipertahankan; hanya penjelasan default yang disesuaikan dengan justifikasi baru.")
+                                 help="Penjelasan yang Anda tulis sendiri dipertahankan; hanya penjelasan default yang disesuaikan.")
             ap3.write("")
             if ap3.button("Terapkan ke semua", key=f"apb_{sel}_{ver}"):
                 n = 0
@@ -1002,27 +1023,37 @@ def render_prov_page():
                 st.rerun()
             st.button("🔄 Reset RTUP ini", on_click=prov_reset_rtup, args=(all_ids,), key=f"prrst_{sel}_{ver}",
                       help="Mengosongkan justifikasi dan penjelasan semua flag pada RTUP ini. RTUP lain tidak terpengaruh.")
-            with st.form(f"prf_{sel}_{ver}"):
-                for i in ids:
-                    r = df.loc[i]
-                    st.markdown(f"**{r['_kode']}** · {get(r, 'blok')} {get(r, 'rincian')} — {get(r, 'deskripsi')}")
-                    st.text(f"Variabel: {get(r, 'var')}   |   Kondisi: {get(r, 'kondisi')}")
-                    st.text(f"Catatan petugas: {get(r, 'catatan')}")
-                    sv = ss.prov_just.get(i, {})
-                    a, b = st.columns([1, 2])
-                    a.selectbox("Justifikasi", STATUS_OPTS, index=STATUS_OPTS.index(sv.get("status", STATUS_PLACEHOLDER)), key=f"pst_{i}_{ver}")
-                    b.text_area("Penjelasan", value=sv["text"] if sv else auto(r), key=f"ptx_{i}_{ver}_{sk}", height=90)
-                ok = st.form_submit_button("💾 Simpan RTUP ini")
-            if ok:
+
+            # tanpa st.form agar pilihan justifikasi langsung memicu pengisian penjelasan
+            for i in ids:
+                r = df.loc[i]
+                st.markdown(f"**{r['_kode']}** · {get(r, 'blok')} {get(r, 'rincian')} — {get(r, 'deskripsi')}")
+                st.text(f"Variabel: {get(r, 'var')}   |   Kondisi: {get(r, 'kondisi')}")
+                st.text(f"Catatan petugas: {get(r, 'catatan')}")
+                sv = ss.prov_just.get(i, {})
+                kst, ktx = f"pst_{i}_{ver}", f"ptx_{i}_{ver}_{sk}"
+                if kst not in ss:
+                    ss[kst] = sv.get("status", STATUS_PLACEHOLDER)
+                if ktx not in ss:
+                    ss[ktx] = sv["text"] if sv else (auto(r, ss[kst]) if ss[kst] != STATUS_PLACEHOLDER else "")
+                a, b = st.columns([1, 2])
+                a.selectbox("Justifikasi", STATUS_OPTS, key=kst, on_change=on_status, args=(i, kst, ktx))
+                b.text_area("Penjelasan", key=ktx, height=110,
+                            placeholder="Pilih justifikasi: penjelasan default akan terisi otomatis.")
+
+            if st.button("💾 Simpan RTUP ini", key=f"prsave_{sel}_{ver}", type="primary"):
                 for i in ids:
                     s_, t_ = ss[f"pst_{i}_{ver}"], ss[f"ptx_{i}_{ver}_{sk}"].strip()
                     if s_ == STATUS_PLACEHOLDER:
                         ss.prov_just.pop(i, None)
                     else:
                         ss.prov_just[i] = {"status": s_, "text": sync_text(df.loc[i], s_, t_)}
+                ss.prov_ver += 1
                 ss.prov_flash = "Tersimpan."
                 st.rerun()
-            lines = [prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"]) for i in ids if i in ss.prov_just]
+
+            lines = [prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"])
+                     for i in ids if i in ss.prov_just]
             st.markdown("**Teks untuk Blok Catatan Anomali (FASIH SM)**")
             if lines:
                 st.code("\n".join(lines), language=None)
