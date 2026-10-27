@@ -84,6 +84,7 @@ OUTLIERS = [
     ("O_13", "*sum"), ("O_14", "*share"),
 ]
 
+DEFAULT_STD = "Sesuai Kondisi Lapangan dan Penuturan Responden"
 STATUS_PLACEHOLDER = "— belum dipilih —"
 STATUS_OPTS = [STATUS_PLACEHOLDER, "Diperbaiki", "Sesuai Kondisi Lapangan", "Non Respon"]
 
@@ -457,6 +458,12 @@ ss.setdefault("log", [])
 ss.setdefault("ver", 0)
 ss.setdefault("flash", None)
 ss.setdefault("demo", False)
+ss.setdefault("up_ver", 0)
+ss.setdefault("toast", None)
+_msg = ss.get("toast")
+if _msg:
+    ss["toast"] = None
+    st.toast(_msg)
 
 
 def reset_state(sig, df):
@@ -464,6 +471,40 @@ def reset_state(sig, df):
     ss.raw = df.copy()
     ss.work = df.copy()
     ss.just, ss.bfl, ss.log, ss.ver, ss.flash = {}, {}, [], 0, None
+
+
+def reset_work():
+    """Kembalikan data kerja ke data awal; hapus justifikasi, flag B, dan log."""
+    if ss.raw is not None:
+        ss.work = ss.raw.copy()
+    ss.just, ss.bfl, ss.log, ss.flash = {}, {}, [], None
+    ss.ver += 1
+    ss.toast = "Data dikembalikan ke kondisi awal."
+
+
+def reset_rtup(sel, idc):
+    """Reset satu RTUP: kembalikan nilai data ke data awal, hapus justifikasi, flag B, dan log RTUP tsb."""
+    rows = ss.raw.index[ss.raw[idc].astype(str).str.strip() == sel]
+    ss.work.loc[rows] = ss.raw.loc[rows]
+    ss.log = [x for x in ss.log if x["id"] != sel]
+    for k in [k for k in ss.just if k[0] == sel]:
+        ss.just.pop(k)
+    ss.bfl.pop(sel, None)
+    for k in [k for k in list(ss.keys()) if isinstance(k, str) and k.startswith(
+            (f"st_{sel}_", f"tx_{sel}_", f"bn_{sel}_", f"bs_{sel}_", f"bt_{sel}_"))]:
+        del ss[k]
+    ss.ver += 1
+    ss.toast = f"RTUP {sel} direset ke kondisi awal."
+
+
+def reset_all():
+    """Hapus semua data & isian (mulai dari awal)."""
+    ss.raw = ss.work = ss.sig = None
+    ss.just, ss.bfl, ss.log, ss.flash = {}, {}, [], None
+    ss.demo = False
+    ss.ver += 1
+    ss.up_ver += 1  # mengosongkan kotak unggah file
+    ss.toast = "Semua data direset."
 
 
 @st.cache_data(show_spinner=False)
@@ -511,6 +552,57 @@ def kode_valid(k: str) -> bool:
     if k.startswith("B_"):
         return bool(re.fullmatch(r"B_\d{2,3}", k))
     return k in FLAG_DESC
+
+
+PROV_MODES = ["Catatan petugas + catatan standar", "Catatan standar saja", "Catatan petugas saja", "Kosongkan"]
+
+
+def auto_text(cat: str, std: str, mode: str) -> str:
+    cat, std = (cat or "").strip(), (std or "").strip()
+    if mode == PROV_MODES[0]:
+        if cat and std:
+            return f"{cat}{'' if cat[-1] in '.!?' else '.'} {std}"
+        return cat or std
+    if mode == PROV_MODES[1]:
+        return std
+    if mode == PROV_MODES[2]:
+        return cat
+    return ""
+
+
+def prov_reset_input():
+    ss.prov_just = {}
+    ss.prov_ver += 1
+    ss.toast = "Isian justifikasi direset."
+
+
+def prov_reset_rtup(ids):
+    for i in ids:
+        ss.prov_just.pop(i, None)
+    ss.prov_ver += 1
+    ss.toast = f"Isian {len(ids)} flag pada RTUP ini direset."
+
+
+def prov_reset_all():
+    ss.prov_df, ss.prov_map, ss.prov_just, ss.prov_sig = None, {}, {}, None
+    ss.prov_gen += 1
+    ss.prov_upv += 1
+    ss["prov_paste"] = ""
+    ss.toast = "Template dan semua isian direset."
+
+
+DEFAULT_SURVEY = "fd68e454-ba45-4b85-8205-f3bf777ded24"
+
+
+def edit_link(link: str, survey_id: str = DEFAULT_SURVEY) -> str:
+    """Padanan rumus Excel:
+    =SUBSTITUTE(link_fasih; "assignment-detail"; "assignment/<ID survei>") & "/edit"
+    Contoh: .../app/assignment-detail/<id>  ->  .../app/assignment/<ID survei>/<id>/edit"""
+    link = (link or "").strip()
+    if not link.startswith("http") or "assignment-detail" not in link:
+        return link
+    new = link.replace("assignment-detail", f"assignment/{(survey_id or DEFAULT_SURVEY).strip()}")
+    return new if new.endswith("/edit") else new + "/edit"
 
 
 def prov_note(kode: str, status: str, text: str) -> str:
@@ -585,15 +677,28 @@ def render_prov_page():
     ss.setdefault("prov_gen", 0)
     ss.setdefault("prov_ver", 0)
     ss.setdefault("prov_flash", None)
+    ss.setdefault("prov_upv", 0)
 
     with st.sidebar:
         st.subheader("⚙️ Pengaturan template")
         tl_done = st.text_input("Isi kolom 'Tindak Lanjut' jika flag selesai", value="Sudah diperiksa",
                                 help="Disesuaikan dengan pilihan dropdown di template Anda.")
-        prefill = st.checkbox("Isi penjelasan otomatis dari Catatan (petugas)", value=True)
-        st.caption("Penjelasan tetap bisa Anda ubah sebelum disimpan.")
+        survey_id = st.text_input("ID survei pada link FASIH (untuk link mode edit)", value=DEFAULT_SURVEY, key="prov_survey",
+                                  help='Dipakai pada rumus: SUBSTITUTE(link; "assignment-detail"; "assignment/<ID survei>") & "/edit"')
+        st.markdown("**📝 Catatan standar**")
+        std = st.text_input("Catatan standar", value=DEFAULT_STD, key="prov_std",
+                            help="Contoh: Sesuai Kondisi Lapangan dan Penuturan Responden")
+        mode = st.radio("Isi penjelasan otomatis dengan", PROV_MODES, key="prov_mode")
+        st.caption("Hasil otomatis tetap bisa Anda ubah sebelum disimpan.")
+        with st.expander("🔄 Reset"):
+            st.button("Reset isian justifikasi", on_click=prov_reset_input, key="prov_r1",
+                      help="Mengosongkan semua justifikasi & penjelasan; template tetap termuat.")
+            st.button("Reset semua (hapus template)", on_click=prov_reset_all, key="prov_r2",
+                      help="Menghapus template yang termuat beserta seluruh isian.")
+    auto = lambda cat: auto_text(cat, std, mode)  # noqa: E731
+    sk = abs(hash((std, mode))) % 10**6
 
-    up = st.file_uploader("Unggah template provinsi (TXT / TSV / CSV / XLSX)", type=["txt", "tsv", "csv", "xlsx", "xls"], key="prov_up")
+    up = st.file_uploader("Unggah template provinsi (TXT / TSV / CSV / XLSX)", type=["txt", "tsv", "csv", "xlsx", "xls"], key=f"prov_up_{ss.prov_upv}")
     with st.expander("…atau tempel langsung dari Excel (termasuk baris judul kolom)"):
         pasted = st.text_area("Tempel di sini", height=120, key="prov_paste")
     try:
@@ -676,16 +781,26 @@ def render_prov_page():
     with t_tab:
         st.caption(f"{len(sub):,} baris tampil. Pilih **Justifikasi** dan isi **Penjelasan**, lalu klik Simpan.")
         b1, b2, b3 = st.columns([2, 2, 1])
-        bulk = b1.selectbox("Isi massal baris terfilter yang belum diisi", STATUS_OPTS[1:], key=f"bulk_{ver}")
-        b2.caption("Penjelasan diambil dari Catatan (petugas). Periksa dulu sebelum dipakai.")
+        bulk = b1.selectbox("Isi massal baris terfilter yang belum diisi", STATUS_OPTS[1:], index=1, key=f"bulk_{ver}")
+        b2.caption("Penjelasan diisi sesuai pengaturan Catatan standar di sidebar. Periksa dulu sebelum dipakai.")
         if b3.button("Terapkan", key=f"bulkb_{ver}"):
             n = 0
             for i in sub.index:
                 if not stat(i):
-                    ss.prov_just[i] = {"status": bulk, "text": get(df.loc[i], "catatan") if prefill else ""}
+                    ss.prov_just[i] = {"status": bulk, "text": auto(get(df.loc[i], "catatan"))}
                     n += 1
             ss.prov_ver += 1
             ss.prov_flash = f"{n} baris diisi '{bulk}'."
+            st.rerun()
+        if st.button("✍️ Isi penjelasan yang masih kosong (baris terfilter yang sudah punya justifikasi)", key=f"fillb_{ver}"):
+            n = 0
+            for i in sub.index:
+                j = ss.prov_just.get(i)
+                if j and not j["text"]:
+                    j["text"] = auto(get(df.loc[i], "catatan"))
+                    n += 1
+            ss.prov_ver += 1
+            ss.prov_flash = f"{n} penjelasan diisi."
             st.rerun()
         view = pd.DataFrame(index=sub.index)
         view["Nama KRT"] = sub[M["krt"]] if "krt" in M else ""
@@ -694,15 +809,18 @@ def render_prov_page():
         view["Variabel & nilai"] = sub[M["var"]] if "var" in M else ""
         view["Deskripsi anomali"] = sub[M["deskripsi"]] if "deskripsi" in M else ""
         view["Catatan (petugas)"] = sub[M["catatan"]] if "catatan" in M else ""
+        if "link" in M:
+            view["Link edit"] = [edit_link(get(df.loc[i], "link"), survey_id) for i in sub.index]
         view["Justifikasi"] = [ss.prov_just.get(i, {}).get("status", STATUS_PLACEHOLDER) for i in sub.index]
         view["Penjelasan"] = [
-            ss.prov_just[i]["text"] if i in ss.prov_just else (get(df.loc[i], "catatan") if prefill else "")
+            ss.prov_just[i]["text"] if i in ss.prov_just else (auto(get(df.loc[i], "catatan")))
             for i in sub.index
         ]
         ed = st.data_editor(
-            view, key=f"pted_{ver}",
+            view, key=f"pted_{ver}_{sk}",
             disabled=[c for c in view.columns if c not in ("Justifikasi", "Penjelasan")],
             column_config={"Justifikasi": st.column_config.SelectboxColumn(options=STATUS_OPTS, required=True),
+                           "Link edit": st.column_config.LinkColumn("Link edit", display_text="✏️ Edit"),
                            "Penjelasan": st.column_config.TextColumn(width="large")},
         )
         if st.button("💾 Simpan tabel", key=f"ptsave_{ver}"):
@@ -736,13 +854,18 @@ def render_prov_page():
                 f"· ART: {get(r0, 'jml_art')} · PPL: {get(r0, 'ppl')} · PML: {get(r0, 'pml')}"
             )
             if get(r0, "link").startswith("http"):
-                st.link_button("🔗 Buka assignment di FASIH SM", get(r0, "link"))
+                lb1, lb2, _ = st.columns([1, 1, 2])
+                lb1.link_button("✏️ Buka mode edit di FASIH SM", edit_link(get(r0, "link"), survey_id), type="primary")
+                lb2.link_button("🔗 Buka detail", get(r0, "link"))
             if st.button("Tandai semua yang belum diisi: 'Sesuai Kondisi Lapangan' (pakai catatan petugas)", key=f"prall_{sel}_{ver}"):
                 for i in ids:
                     if not stat(i):
-                        ss.prov_just[i] = {"status": "Sesuai Kondisi Lapangan", "text": get(df.loc[i], "catatan") if prefill else ""}
+                        ss.prov_just[i] = {"status": "Sesuai Kondisi Lapangan", "text": auto(get(df.loc[i], "catatan"))}
                 ss.prov_ver += 1
                 st.rerun()
+            all_ids = df.index[df["_aid"] == sel].tolist()
+            st.button("🔄 Reset RTUP ini", on_click=prov_reset_rtup, args=(all_ids,), key=f"prrst_{sel}_{ver}",
+                      help="Mengosongkan justifikasi dan penjelasan semua flag pada RTUP ini. RTUP lain tidak terpengaruh.")
             with st.form(f"prf_{sel}_{ver}"):
                 for i in ids:
                     r = df.loc[i]
@@ -752,11 +875,11 @@ def render_prov_page():
                     sv = ss.prov_just.get(i, {})
                     a, b = st.columns([1, 2])
                     a.selectbox("Justifikasi", STATUS_OPTS, index=STATUS_OPTS.index(sv.get("status", STATUS_PLACEHOLDER)), key=f"pst_{i}_{ver}")
-                    b.text_area("Penjelasan", value=sv["text"] if sv else (get(r, "catatan") if prefill else ""), key=f"ptx_{i}_{ver}", height=90)
+                    b.text_area("Penjelasan", value=sv["text"] if sv else auto(get(r, "catatan")), key=f"ptx_{i}_{ver}_{sk}", height=90)
                 ok = st.form_submit_button("💾 Simpan RTUP ini")
             if ok:
                 for i in ids:
-                    s_, t_ = ss[f"pst_{i}_{ver}"], ss[f"ptx_{i}_{ver}"].strip()
+                    s_, t_ = ss[f"pst_{i}_{ver}"], ss[f"ptx_{i}_{ver}_{sk}"].strip()
                     if s_ == STATUS_PLACEHOLDER:
                         ss.prov_just.pop(i, None)
                     else:
@@ -804,13 +927,15 @@ def render_prov_page():
             if "tindak" in M and tl_done:
                 out.at[i, M["tindak"]] = tl_done
 
+        if "link" in M:
+            out["Link Edit FASIH"] = [edit_link(df.at[i, M["link"]], survey_id) for i in df.index]
         rows = []
         for a, g in df.groupby("_aid", sort=False):
             ids = g.index.tolist()
             d = [i for i in ids if i in ss.prov_just]
             r0 = df.loc[ids[0]]
             rows.append({
-                "id_assignment": a, "link": get(r0, "link"), "nama_krt": get(r0, "krt"), "desa": get(r0, "desa"),
+                "id_assignment": a, "link": get(r0, "link"), "link_edit": edit_link(get(r0, "link"), survey_id), "nama_krt": get(r0, "krt"), "desa": get(r0, "desa"),
                 "sls": get(r0, "sls"), "ppl": get(r0, "ppl"), "pml": get(r0, "pml"),
                 "jumlah_flag": len(ids), "selesai": len(d),
                 "status": "Lengkap" if len(d) == len(ids) else "Belum lengkap",
@@ -862,7 +987,7 @@ if menu == MENU_PROV:
     st.stop()
 
 with st.sidebar:
-    up = st.file_uploader("Unggah data SKP (CSV / Excel)", type=["csv", "xlsx", "xls"])
+    up = st.file_uploader("Unggah data SKP (CSV / Excel)", type=["csv", "xlsx", "xls"], key=f"up_{ss.up_ver}")
     sheet = None
     if up is not None and not up.name.lower().endswith(".csv"):
         try:
@@ -875,6 +1000,11 @@ with st.sidebar:
     if c1.button("Data contoh"):
         ss.demo = True
     c2.download_button("Template", template_csv(), "template_kolom_skp2026.csv", "text/csv")
+    with st.expander("🔄 Reset"):
+        st.button("Kembalikan ke data awal", on_click=reset_work, key="rst_work",
+                  help="Membatalkan semua edit data, justifikasi, flag B, dan log. File tetap termuat.")
+        st.button("Reset semua (hapus data)", on_click=reset_all, key="rst_all",
+                  help="Menghapus file yang termuat beserta seluruh isian.")
 
     if up is not None:
         ss.demo = False
@@ -887,6 +1017,12 @@ with st.sidebar:
     elif ss.demo and ss.sig != ("demo",):
         reset_state(("demo",), make_demo())
 
+    st.divider()
+    st.subheader("📝 Catatan standar")
+    std_note = st.text_input("Catatan standar", value=DEFAULT_STD, key="std_note",
+                             help="Contoh: Sesuai Kondisi Lapangan dan Penuturan Responden")
+    use_std = st.checkbox("Isi otomatis ke kolom penjelasan", value=True, key="use_std",
+                          help="Dipakai sebagai isian awal penjelasan bila belum ada penjelasan tersimpan. Tetap bisa diedit.")
     st.divider()
     st.subheader("⚙️ Parameter deteksi")
     only_elig = st.checkbox(
@@ -912,6 +1048,9 @@ with st.sidebar:
         P["ignore_zero"] = st.checkbox("Abaikan nilai 0 saat menghitung batas", value=True)
         st.caption("Pedoman merujuk dashboard FASIH untuk daftar outlier resmi; "
                    "metode ini hanya pendekatan pembantu bila dashboard belum tersedia.")
+
+std_default = std_note.strip() if use_std else ""
+stdk = abs(hash(std_default)) % 10**6
 
 # =============================================================================
 # 9. HALAMAN UTAMA
@@ -1087,6 +1226,8 @@ with tab_review:
 
         # ---- A. daftar flag
         st.subheader(f"RTUP {sel}")
+        st.button("🔄 Reset RTUP ini", on_click=reset_rtup, args=(sel, IDC), key=f"rstr_{sel}",
+                  help="Mengembalikan nilai data RTUP ini ke data awal serta menghapus justifikasi, flag B, dan log perubahannya. RTUP lain tidak terpengaruh.")
         if g.empty:
             st.caption("RTUP ini tidak memiliki flag dari daftar anomali/outlier.")
         else:
@@ -1136,12 +1277,12 @@ with tab_review:
                     a, b = st.columns([1, 2])
                     cur = saved.get("status", STATUS_PLACEHOLDER)
                     a.selectbox("Justifikasi", STATUS_OPTS, index=STATUS_OPTS.index(cur), key=f"st_{sel}_{k}")
-                    b.text_area("Penjelasan hasil konfirmasi", value=saved.get("text", ""), key=f"tx_{sel}_{k}",
+                    b.text_area("Penjelasan hasil konfirmasi", value=saved.get("text") or std_default, key=f"tx_{sel}_{k}_{stdk}",
                                 height=80, placeholder="Hasil konfirmasi kepada petugas atau responden, …")
                 submitted = st.form_submit_button("💾 Simpan justifikasi")
             if submitted:
                 for k in g["kode"]:
-                    stt, txt = ss[f"st_{sel}_{k}"], ss[f"tx_{sel}_{k}"].strip()
+                    stt, txt = ss[f"st_{sel}_{k}"], ss[f"tx_{sel}_{k}_{stdk}"].strip()
                     if stt == STATUS_PLACEHOLDER:
                         ss.just.pop((sel, k), None)
                     else:
