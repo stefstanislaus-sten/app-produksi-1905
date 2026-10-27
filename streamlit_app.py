@@ -14,14 +14,27 @@ Fitur:
      (format  #[KODE]: Diperbaiki / Sesuai Kondisi Lapangan / Non Respon# penjelasan).
   6. Flagging di luar daftar (B_xx, BPS Provinsi).
   7. Unduh hasil (Excel / CSV), log perubahan, dan data bersih.
+  8. Penyimpanan otomatis (tahan refresh): data unggahan, edit, justifikasi, draft, pengaturan.
 
 Jalankan:  streamlit run app.py
+
+Variabel lingkungan (opsional):
+  SKP_WS_DIR          folder penyimpanan (bawaan: .skp_workspaces di samping app.py)
+  SKP_WS_TTL_DAYS     hapus ruang kerja yang tidak dipakai > N hari (bawaan 30)
+  SKP_WS_MAX_MB       batas total penyimpanan; yang terlama dihapus lebih dulu (bawaan 500)
+  SKP_AUTO_RESUME=1   bila URL dibuka tanpa ?ws=ID, otomatis membuka ruang kerja terakhir
+                      (cocok untuk pemakaian pribadi/lokal; jangan dipakai di server bersama)
 """
+import hashlib
 import html as _html
 import io
 import json
 import math
+import os
 import re
+import shutil
+import time
+import uuid
 from datetime import datetime
 
 import numpy as np
@@ -514,6 +527,7 @@ def reset_state(sig, df):
     ss.raw = df.copy()
     ss.work = df.copy()
     ss.just, ss.bfl, ss.log, ss.ver, ss.flash = {}, {}, [], 0, None
+    ss.pop("_map_cache", None)       # pemetaan kolom file lama tidak berlaku untuk file baru
 
 
 def reset_work():
@@ -560,6 +574,7 @@ def reset_all():
     ss.raw = ss.work = ss.sig = None
     ss.just, ss.bfl, ss.log, ss.flash = {}, {}, [], None
     ss.demo = False
+    ss.pop("_map_cache", None)
     ss.ver += 1
     ss.up_ver += 1  # mengosongkan kotak unggah file
     ss.toast = "Semua data direset."
@@ -588,6 +603,8 @@ def to_excel(sheets: dict) -> bytes:
 # =============================================================================
 MENU_MAIN = "🧹 Cleaning Data Lapangan"
 MENU_PROV = "🗂️ Template Provinsi (flag B_xx)"
+
+PROV_VIEWS = ["📋 Mode tabel (cepat)", "🏠 Mode per RTUP", "📥 Hasil & Unduh", "📊 Ringkasan"]
 
 PROV_PATTERNS = [
     ("link", r"^link"), ("kab", r"r102"), ("kec", r"r103"), ("desa", r"r104"), ("sls", r"r107"),
@@ -720,6 +737,7 @@ def prov_clear_widgets(ids=None):
 
 def prov_reset_input():
     ss.prov_just = {}
+    ss["prov_draft"] = None
     prov_clear_widgets()
     ss.pop("prov_loaded", None)
     ss.prov_ver += 1
@@ -729,6 +747,7 @@ def prov_reset_input():
 def prov_reset_rtup(ids):
     for i in ids:
         ss.prov_just.pop(i, None)
+    ss["prov_draft"] = None
     prov_clear_widgets(ids)
     ss.prov_ver += 1
     ss["prov_full"] = True
@@ -737,6 +756,7 @@ def prov_reset_rtup(ids):
 
 def prov_reset_all():
     ss.prov_df, ss.prov_map, ss.prov_just, ss.prov_sig = None, {}, {}, None
+    ss["prov_draft"] = None
     ss.prov_gen += 1
     ss.prov_upv += 1
     ss["prov_paste"] = ""
@@ -841,20 +861,18 @@ def render_prov_page():
     ss.setdefault("prov_ver", 0)
     ss.setdefault("prov_flash", None)
     ss.setdefault("prov_upv", 0)
+    ss.setdefault("prov_draft", None)
 
-    VIEWS = ["📋 Mode tabel (cepat)", "🏠 Mode per RTUP", "📥 Hasil & Unduh", "📊 Ringkasan"]
-    # keep-alive: nilai tetap tersimpan walau widgetnya sedang tidak tampil (mis. saat pindah tampilan)
-    for _k, _v in (("prov_tpl_no", TPL_NO), ("prov_tpl_yes", TPL_YES), ("prov_tpl_fno", TPL_FIX_NO),
-                   ("prov_tpl_fyes", TPL_FIX_YES), ("prov_nmode", NILAI_MODES[0]), ("prov_view", VIEWS[0])):
-        ss[_k] = ss.get(_k, _v)
+    VIEWS = PROV_VIEWS
+    # nilai pengaturan dijaga (keep-alive) + dipulihkan dari penyimpanan oleh SETTING_DEFAULTS (bagian 7c)
     tpl_no, tpl_yes, tpl_fno, tpl_fyes, nmode = (
         ss["prov_tpl_no"], ss["prov_tpl_yes"], ss["prov_tpl_fno"], ss["prov_tpl_fyes"], ss["prov_nmode"])
 
     with st.sidebar:
         st.subheader("⚙️ Pengaturan template")
-        tl_done = st.text_input("Isi kolom 'Tindak Lanjut' jika flag selesai", value="Sudah diperiksa",
+        tl_done = st.text_input("Isi kolom 'Tindak Lanjut' jika flag selesai", key="prov_tl",
                                 help="Disesuaikan dengan pilihan dropdown di template Anda.")
-        survey_id = st.text_input("ID survei pada link FASIH (untuk link mode edit)", value=DEFAULT_SURVEY, key="prov_survey",
+        survey_id = st.text_input("ID survei pada link FASIH (untuk link mode edit)", key="prov_survey",
                                   help='Dipakai pada rumus: SUBSTITUTE(link; "assignment-detail"; "assignment/<ID survei>") & "/edit"')
         with st.expander("🔄 Reset"):
             st.button("Reset isian justifikasi", on_click=prov_reset_input, key="prov_r1",
@@ -891,6 +909,7 @@ def render_prov_page():
                 ss.prov_just.pop(i, None)
             else:
                 ss.prov_just[i] = {"status": s_, "text": sync_text(ss.prov_df.loc[i], s_, t_)}
+        ss["prov_draft"] = None
         prov_clear_widgets(ids)
         ss.prov_ver += 1                 # kunci widget baru -> isian dimuat ulang dari data tersimpan
         ss["prov_full"] = True           # muat ulang penuh agar ringkasan ikut diperbarui
@@ -906,6 +925,7 @@ def render_prov_page():
                 cur = ss.get(f"ptx_{i}_{gen}_{pv}_{sk_}", ss.prov_just.get(i, {}).get("text", ""))
                 ss.prov_just[i] = {"status": stt, "text": sync_text(ss.prov_df.loc[i], stt, cur)}
                 n += 1
+        ss["prov_draft"] = None
         prov_clear_widgets(all_ids)
         ss.prov_ver += 1
         ss["prov_full"] = True
@@ -919,7 +939,7 @@ def render_prov_page():
             sig = ("f", up.name, up.size)
             raw_df = prov_read(up.getvalue(), up.name) if ss.prov_sig != sig else None
         elif pasted.strip():
-            sig = ("p", hash(pasted))
+            sig = ("p", hashlib.md5(pasted.encode("utf-8")).hexdigest())
             raw_df = prov_read_text(pasted).fillna("").astype(str) if ss.prov_sig != sig else None
         else:
             sig, raw_df = None, None
@@ -928,9 +948,11 @@ def render_prov_page():
             d, M = prov_prepare(raw_df)
             ss.prov_sig, ss.prov_df, ss.prov_map = sig, d, M
             ss.prov_just, ss.prov_ver = {}, 0
+            ss["prov_draft"] = None
             ss.prov_gen += 1
             ss.pop("prov_loaded", None)
             ss.pop("prov_sel", None)
+            persist()                      # simpan template segera setelah dimuat
     except Exception as e:
         st.error(f"Gagal membaca template: {e}")
 
@@ -945,6 +967,8 @@ def render_prov_page():
     if df.empty:
         st.warning("Tidak ada baris data.")
         return
+    if up is None and not pasted.strip() and ss.prov_sig:
+        st.caption("📂 Template aktif dipulihkan dari penyimpanan otomatis; tidak perlu unggah ulang.")
 
     ver = f"{ss.prov_gen}_{ss.prov_ver}"   # hanya untuk Mode tabel
     gen = str(ss.prov_gen)
@@ -1074,15 +1098,16 @@ def render_prov_page():
                         n += 1
                 ss.toast = f"Tabel tersimpan ({n} baris berubah)."
                 ss.prov_ver += 1
+                persist()
                 st.rerun()
 
     # ---------------- MODE PER RTUP
     if view_sel == VIEWS[1]:
         ss.pop("prov_full", None)
         st.caption("Pilih **Justifikasi** pada tiap flag: penjelasan default langsung terisi sesuai justifikasi. "
-                   "Perubahan baru masuk ke tabel setelah klik **Simpan RTUP ini**. "
-                   "Isian yang belum disimpan akan dibuang saat pindah RTUP, dan RTUP yang dipilih selalu "
-                   "dimuat sesuai data tersimpan.")
+                   "Perubahan baru masuk ke tabel setelah klik **Simpan RTUP ini**; sebelum itu isian disimpan "
+                   "sebagai **draft otomatis** (aman bila halaman ter-refresh). Draft hanya untuk RTUP yang sedang "
+                   "dibuka dan dibuang saat pindah RTUP.")
         with st.expander("🧩 Atur template catatan default (opsional)"):
             st.markdown("**Sesuai Kondisi Lapangan**")
             st.text_area("Template tanpa nilai", key="prov_tpl_no", height=100)
@@ -1168,6 +1193,14 @@ def render_prov_page():
                 st.button("🔄 Reset RTUP ini", on_click=prov_reset_rtup, args=(all_ids,), key=f"prrst_{sel}_{gen}",
                           help="Mengosongkan justifikasi dan penjelasan semua flag pada RTUP ini. RTUP lain tidak terpengaruh.")
 
+                # draft otomatis (hanya berlaku untuk RTUP yang sama dengan yang tersimpan)
+                dr = ss.get("prov_draft") or {}
+                drows = dr.get("rows", {}) if dr.get("sel") == sel else {}
+                restored = bool(drows) and ss.get("_draft_notice") != (sel, pv)
+                if restored:
+                    ss["_draft_notice"] = (sel, pv)
+                    st.info("Draft isian yang belum disimpan dipulihkan. Klik **Simpan RTUP ini** untuk memasukkannya ke tabel.")
+
                 # tanpa st.form agar pilihan justifikasi langsung memicu pengisian penjelasan
                 for i in ids:
                     r = df.loc[i]
@@ -1175,11 +1208,12 @@ def render_prov_page():
                     st.text(f"Variabel: {get(r, 'var')}   |   Kondisi: {get(r, 'kondisi')}")
                     st.text(f"Catatan petugas: {get(r, 'catatan')}")
                     sv = ss.prov_just.get(i, {})
+                    dv = drows.get(str(i))
                     kst, ktx = f"pst_{i}_{gen}_{pv}", f"ptx_{i}_{gen}_{pv}_{sk}"
                     if kst not in ss:
-                        ss[kst] = sv.get("status", STATUS_PLACEHOLDER)
+                        ss[kst] = dv[0] if dv else sv.get("status", STATUS_PLACEHOLDER)
                     if ktx not in ss:
-                        ss[ktx] = sv["text"] if sv else (auto(r, ss[kst]) if ss[kst] != STATUS_PLACEHOLDER else "")
+                        ss[ktx] = dv[1] if dv else (sv["text"] if sv else (auto(r, ss[kst]) if ss[kst] != STATUS_PLACEHOLDER else ""))
                     a, b = st.columns([1, 2])
                     a.selectbox("Justifikasi", STATUS_OPTS, key=kst, on_change=on_status, args=(i, kst, ktx))
                     b.text_area("Penjelasan", key=ktx, height=110,
@@ -1189,12 +1223,21 @@ def render_prov_page():
                     j = ss.prov_just.get(i)
                     return (j["status"], j["text"]) if j else (STATUS_PLACEHOLDER, "")
 
-                dirty = any((ss[f"pst_{i}_{gen}_{pv}"], str(ss[f"ptx_{i}_{gen}_{pv}_{sk}"]).strip()) != _saved(i)
-                            for i in ids)
+                cur = {str(i): [ss[f"pst_{i}_{gen}_{pv}"], str(ss[f"ptx_{i}_{gen}_{pv}_{sk}"])]
+                       for i in ids
+                       if (ss[f"pst_{i}_{gen}_{pv}"], str(ss[f"ptx_{i}_{gen}_{pv}_{sk}"]).strip()) != _saved(i)}
+                dirty = bool(cur)
                 sv1, sv2 = st.columns([1, 3])
                 sv1.button("💾 Simpan RTUP ini", key=f"prsave_{sel}_{gen}", type="primary",
                            on_click=save_rtup, args=(ids, gen, sk))
-                sv2.caption("⚠️ Ada perubahan yang belum disimpan." if dirty else "✅ Semua perubahan RTUP ini sudah tersimpan.")
+                sv2.caption("📝 Draft belum disimpan ke tabel (sudah aman dari refresh)." if dirty
+                            else "✅ Semua perubahan RTUP ini sudah tersimpan.")
+
+                # simpan draft ke penyimpanan hanya bila berubah (menulis berkas JSON kecil)
+                nd = {"sel": sel, "rows": cur} if cur else None
+                if nd != ss.get("prov_draft"):
+                    ss["prov_draft"] = nd
+                    persist()
 
                 lines = [prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"])
                          for i in ids if i in ss.prov_just]
@@ -1306,15 +1349,398 @@ def render_prov_page():
 
 
 # =============================================================================
+# 7c. PENYIMPANAN OTOMATIS (tahan refresh)
+# =============================================================================
+# Prinsip hemat & efektif:
+#  * Data unggahan (Excel/CSV) disimpan SEKALI dalam bentuk terkompresi (parquet+zstd; bila pustaka
+#    pyarrow tidak ada -> gzip-pickle), bukan setiap interaksi. File asli tidak perlu disimpan:
+#    isi tabel (teks) sudah cukup dan jauh lebih kecil.
+#  * Hasil edit disimpan sebagai JSON kecil (log perubahan, justifikasi, flag B, draft, pengaturan).
+#    Data kerja tidak disimpan ulang: dibangun kembali = data awal + log perubahan.
+#  * Tulis hanya bila isi berubah (hash) dan atomik (berkas sementara -> ganti).
+#  * Ruang kerja terpisah per URL (?ws=ID); dibersihkan otomatis: > SKP_WS_TTL_DAYS hari tak dipakai,
+#    dan bila total melewati SKP_WS_MAX_MB (yang terlama dihapus lebih dulu).
+WS_ROOT = os.environ.get("SKP_WS_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(globals().get("__file__", "app.py"))), ".skp_workspaces")
+WS_TTL_DAYS = float(os.environ.get("SKP_WS_TTL_DAYS", "30"))
+WS_MAX_MB = float(os.environ.get("SKP_WS_MAX_MB", "500"))
+AUTO_RESUME = os.environ.get("SKP_AUTO_RESUME", "0") == "1"
+WS_RE = re.compile(r"[0-9a-f]{16}")
+NONE_LBL = "(tidak ada)"
+STORE_PH = None
+
+# pengaturan yang ikut disimpan & dipulihkan (key widget -> nilai bawaan)
+SETTING_DEFAULTS = {
+    "std_note": DEFAULT_STD, "use_std": True, "only_elig": True,
+    "p_jam": 112, "p_upah": 1_000_000, "p_rasio": 3.6, "p_listrik": 25, "p_tani": 1_000_000,
+    "p_method": "IQR", "p_kiqr": 3.0, "p_kz": 3.5, "p_zero": True,
+    "menu_sel": MENU_MAIN, "prov_view": PROV_VIEWS[0], "prov_survey": DEFAULT_SURVEY, "prov_tl": "Sudah diperiksa",
+    "prov_tpl_no": TPL_NO, "prov_tpl_yes": TPL_YES, "prov_tpl_fno": TPL_FIX_NO, "prov_tpl_fyes": TPL_FIX_YES,
+    "prov_nmode": NILAI_MODES[0], "prov_sel": None,
+}
+# pengaman: nilai tersimpan yang bukan lagi pilihan yang sah (mis. label berubah antar versi) dikembalikan ke bawaan
+SETTING_CHOICES = {
+    "menu_sel": [MENU_MAIN, MENU_PROV], "prov_view": PROV_VIEWS,
+    "p_method": ["IQR", "Modified Z-score"], "prov_nmode": NILAI_MODES,
+}
+
+
+def _jd(o):
+    return o.item() if hasattr(o, "item") else str(o)
+
+
+def _ph(kind, msg):
+    """Tulis ke placeholder status di sidebar; aman dipanggil dari dalam fragment."""
+    try:
+        if STORE_PH is not None:
+            getattr(STORE_PH, kind)(msg)
+    except Exception:
+        pass
+
+
+def _dir_size(d):
+    try:
+        return sum(e.stat().st_size for e in os.scandir(d) if e.is_file())
+    except OSError:
+        return 0
+
+
+def _ws_mtime(d):
+    sf = os.path.join(d, "state.json")
+    try:
+        return os.path.getmtime(sf) if os.path.exists(sf) else os.path.getmtime(d)
+    except OSError:
+        return 0.0
+
+
+def enforce_quota(keep=None):
+    """Bila total penyimpanan melewati batas, hapus ruang kerja terlama (kecuali yang sedang dipakai)."""
+    try:
+        if not os.path.isdir(WS_ROOT):
+            return
+        items = []
+        for name in os.listdir(WS_ROOT):
+            d = os.path.join(WS_ROOT, name)
+            if os.path.isdir(d):
+                items.append((_ws_mtime(d), name, _dir_size(d)))
+        total, cap = sum(x[2] for x in items), WS_MAX_MB * 1024 * 1024
+        for _, name, size in sorted(items):
+            if total <= cap:
+                break
+            if name == keep:
+                continue
+            shutil.rmtree(os.path.join(WS_ROOT, name), ignore_errors=True)
+            total -= size
+    except OSError:
+        pass
+
+
+@st.cache_resource(show_spinner=False)
+def purge_old_workspaces(root, ttl_days):
+    """Hapus ruang kerja yang tidak dipakai melewati batas hari (dijalankan sekali per proses server)."""
+    n = 0
+    try:
+        if os.path.isdir(root):
+            lim = time.time() - ttl_days * 86400
+            for name in os.listdir(root):
+                d = os.path.join(root, name)
+                if os.path.isdir(d) and _ws_mtime(d) < lim:
+                    shutil.rmtree(d, ignore_errors=True)
+                    n += 1
+    except OSError:
+        pass
+    enforce_quota()
+    return n
+
+
+def latest_workspace():
+    """ID ruang kerja yang paling baru dipakai (untuk SKP_AUTO_RESUME)."""
+    best = None
+    try:
+        for name in os.listdir(WS_ROOT) if os.path.isdir(WS_ROOT) else []:
+            d = os.path.join(WS_ROOT, name)
+            if WS_RE.fullmatch(name) and os.path.exists(os.path.join(d, "state.json")):
+                mt = _ws_mtime(d)
+                if best is None or mt > best[0]:
+                    best = (mt, name)
+    except OSError:
+        pass
+    return best[1] if best else None
+
+
+def ws_file(name):
+    return os.path.join(WS_ROOT, ss["ws_id"], name)
+
+
+def _atomic_bytes(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _has_df(stem):
+    return os.path.exists(stem + ".parquet") or os.path.exists(stem + ".pkl.gz")
+
+
+def _del_df(stem):
+    for ext in (".parquet", ".pkl.gz"):
+        try:
+            os.remove(stem + ext)
+        except OSError:
+            pass
+
+
+def _save_df(df, stem):
+    """Simpan DataFrame teks: parquet (zstd) bila tersedia; bila gagal -> gzip-pickle, sehingga tidak pernah gagal diam-diam."""
+    pq, pk = stem + ".parquet", stem + ".pkl.gz"
+    try:
+        tmp = pq + ".tmp"
+        try:
+            df.to_parquet(tmp, index=False, compression="zstd")
+        except Exception:
+            df.to_parquet(tmp, index=False, compression="snappy")
+        os.replace(tmp, pq)
+        if os.path.exists(pk):
+            os.remove(pk)
+    except Exception:
+        try:
+            os.remove(pq + ".tmp")
+        except OSError:
+            pass
+        tmp = pk + ".tmp"
+        df.to_pickle(tmp, compression="gzip")
+        os.replace(tmp, pk)
+        if os.path.exists(pq):
+            os.remove(pq)
+
+
+def _load_df(stem):
+    if os.path.exists(stem + ".parquet"):
+        return pd.read_parquet(stem + ".parquet")
+    return pd.read_pickle(stem + ".pkl.gz", compression="gzip")
+
+
+def wipe_memory():
+    """Kosongkan data di memori sesi (dipakai saat berpindah ruang kerja)."""
+    ss.raw = ss.work = ss.sig = None
+    ss.just, ss.bfl, ss.log, ss.flash, ss.demo = {}, {}, [], None, False
+    ss["prov_df"], ss["prov_map"], ss["prov_just"], ss["prov_sig"], ss["prov_draft"] = None, {}, {}, None, None
+    for k in ("up_ver", "prov_upv", "ver", "prov_gen"):
+        ss[k] = ss.get(k, 0) + 1
+    for k in list(ss.keys()):
+        if isinstance(k, str) and k.startswith(("map_", "pst_", "ptx_", "pf_", "_map_cache", "_persist_hash",
+                                                  "_raw_saved_sig", "_prov_saved_sig", "_set_cache", "prov_loaded")):
+            del ss[k]
+
+
+def init_ws():
+    """ID ruang kerja diambil dari URL (?ws=ID) sehingga tetap sama setelah refresh."""
+    wid = st.query_params.get("ws")
+    if isinstance(wid, (list, tuple)):
+        wid = wid[0] if wid else None
+    if wid and WS_RE.fullmatch(str(wid)):
+        wid = str(wid)
+        if ss.get("ws_id") != wid:
+            if ss.get("ws_id") is not None:
+                wipe_memory()
+            ss["ws_id"] = wid
+            ss["_ws_loaded"] = False
+    else:
+        wid = ss.get("ws_id") or (latest_workspace() if AUTO_RESUME else None) or uuid.uuid4().hex[:16]
+        ss["ws_id"] = wid
+        st.query_params["ws"] = wid
+
+
+def ws_switch():
+    w = (ss.get("ws_other") or "").strip().lower()
+    if WS_RE.fullmatch(w):
+        wipe_memory()
+        ss["ws_id"] = w
+        ss["_ws_loaded"] = False
+        st.query_params["ws"] = w
+        ss.toast = "Membuka ruang kerja …"
+    else:
+        ss.toast = "ID ruang kerja tidak valid (16 karakter huruf a-f / angka)."
+
+
+def ws_new():
+    """Mulai ruang kerja baru (dipakai bila pemulihan gagal atau ingin memulai dari nol)."""
+    wipe_memory()
+    wid = uuid.uuid4().hex[:16]
+    ss["ws_id"] = wid
+    ss["_ws_loaded"] = True
+    ss["_ws_ok"] = True
+    ss.pop("_ws_err", None)
+    st.query_params["ws"] = wid
+    ss.toast = "Ruang kerja baru dibuat."
+
+
+def load_workspace():
+    """Pulihkan data & isian dari penyimpanan. Data kerja = data awal + log perubahan."""
+    sf = ws_file("state.json")
+    if not os.path.exists(sf):
+        return False
+    with open(sf, "rb") as f:
+        blob = f.read()
+    S = json.loads(blob.decode("utf-8"))
+    cache = dict(S.get("settings") or {})
+    ss["_set_cache"] = cache
+    for k, v in cache.items():
+        if k in SETTING_DEFAULTS:
+            ss[k] = v
+    got = False
+    m = S.get("main")
+    if m:
+        sig = tuple(m["sig"])
+        if sig == ("demo",):
+            raw = make_demo()
+            ss.demo = True
+        else:
+            raw = _load_df(ws_file("main_raw"))
+            ss.demo = False
+        ss.sig, ss.raw, ss.work = sig, raw, raw.copy()
+        ss.log = list(m.get("log") or [])
+        for x in ss.log:
+            if x["kolom"] in ss.work.columns and x["baris"] in ss.work.index:
+                ss.work.at[x["baris"], x["kolom"]] = x["nilai_baru"]
+        ss.just = {(a, b): {"status": c, "text": t} for a, b, c, t in (m.get("just") or [])}
+        ss.bfl = m.get("bfl") or {}
+        ss["_map_cache"] = m.get("mapping") or {}
+        ss["_raw_saved_sig"] = sig
+        got = True
+    p = S.get("prov")
+    if p:
+        ss["prov_df"] = _load_df(ws_file("prov_df"))
+        ss["prov_map"] = p.get("map") or {}
+        ss["prov_sig"] = tuple(p["sig"]) if p.get("sig") else None
+        ss["prov_just"] = {int(i): {"status": c, "text": t} for i, c, t in (p.get("just") or [])}
+        ss["prov_draft"] = p.get("draft")
+        for k in ("prov_gen", "prov_ver", "prov_upv"):
+            ss.setdefault(k, 0)
+        ss["_prov_saved_sig"] = ss["prov_sig"]
+        got = True
+    ss["_persist_hash"] = hashlib.md5(blob).hexdigest()
+    try:
+        os.utime(sf, None)      # tandai ruang kerja masih dipakai (menunda penghapusan otomatis)
+    except OSError:
+        pass
+    return got
+
+
+def _store_msg():
+    if not ss.get("_ws_ok", True):
+        return
+    d = os.path.join(WS_ROOT, ss["ws_id"])
+    _ph("caption", f"✅ Tersimpan otomatis pukul {ss.get('_last_saved', '-')} · {_dir_size(d) / 1024:,.0f} KB")
+
+
+def persist(mapping=None):
+    """Simpan keadaan terkini bila ada perubahan. Aman dipanggil berulang (tulis hanya jika isi berubah)."""
+    if not ss.get("ws_id") or not ss.get("_ws_ok", True):
+        return
+    try:
+        if mapping is not None:
+            ss["_map_cache"] = {k: (v or NONE_LBL) for k, v in mapping.items()}
+        cache = ss.setdefault("_set_cache", {})
+        for k in SETTING_DEFAULTS:
+            if k in ss:
+                cache[k] = ss[k]
+        main = prov = None
+        if ss.raw is not None:
+            main = dict(
+                sig=list(ss.sig), demo=bool(ss.demo),
+                just=[[i, k, v["status"], v["text"]] for (i, k), v in ss.just.items()],
+                bfl=ss.bfl, log=ss.log, mapping=ss.get("_map_cache", {}))
+        if ss.get("prov_df") is not None:
+            prov = dict(
+                sig=list(ss.prov_sig) if ss.get("prov_sig") else None, map=ss.get("prov_map") or {},
+                just=[[int(i), v["status"], v["text"]] for i, v in (ss.get("prov_just") or {}).items()],
+                draft=ss.get("prov_draft"))
+        d = os.path.join(WS_ROOT, ss["ws_id"])
+        if main is None and prov is None:           # tidak ada yang perlu disimpan -> bersihkan
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+            ss["_persist_hash"] = ss["_raw_saved_sig"] = ss["_prov_saved_sig"] = None
+            _ph("caption", "Belum ada data yang disimpan.")
+            return
+        os.makedirs(d, exist_ok=True)
+        rp, pp, sf = (os.path.join(d, n) for n in ("main_raw", "prov_df", "state.json"))
+        # data besar: ditulis sekali saja (hanya saat file baru dimuat)
+        if main is not None and ss.sig != ("demo",):
+            if ss.get("_raw_saved_sig") != ss.sig or not _has_df(rp):
+                _save_df(ss.raw, rp)
+                ss["_raw_saved_sig"] = ss.sig
+                enforce_quota(keep=ss["ws_id"])
+        elif _has_df(rp):
+            _del_df(rp)
+            ss["_raw_saved_sig"] = None
+        if prov is not None:
+            if ss.get("_prov_saved_sig") != ss.get("prov_sig") or not _has_df(pp):
+                _save_df(ss.prov_df, pp)
+                ss["_prov_saved_sig"] = ss.get("prov_sig")
+        elif _has_df(pp):
+            _del_df(pp)
+            ss["_prov_saved_sig"] = None
+        # isian kecil: JSON, ditulis hanya bila berubah
+        blob = json.dumps({"v": 2, "main": main, "prov": prov, "settings": cache},
+                          ensure_ascii=False, separators=(",", ":"), default=_jd).encode("utf-8")
+        h = hashlib.md5(blob).hexdigest()
+        if h != ss.get("_persist_hash") or not os.path.exists(sf):
+            _atomic_bytes(sf, blob)
+            ss["_persist_hash"] = h
+            ss["_last_saved"] = datetime.now().strftime("%H:%M:%S")
+        _store_msg()
+    except Exception as e:  # noqa
+        _ph("warning", f"Gagal menyimpan otomatis: {e}")
+
+
+purge_old_workspaces(WS_ROOT, WS_TTL_DAYS)
+init_ws()
+if not ss.get("_ws_loaded"):
+    ss["_ws_loaded"] = True
+    ss["_ws_ok"] = True
+    ss.pop("_ws_err", None)
+    try:
+        if load_workspace():
+            st.toast("Data & isian dipulihkan dari penyimpanan otomatis.")
+    except Exception as e:  # noqa
+        ss["_ws_ok"] = False     # jangan menimpa penyimpanan lama bila pemulihan gagal
+        ss["_ws_err"] = f"Gagal memulihkan penyimpanan: {e}"
+# jaga nilai pengaturan di setiap run (dan pulihkan dari penyimpanan bila hilang)
+_cache0 = ss.get("_set_cache", {})
+for _k, _d in SETTING_DEFAULTS.items():
+    ss[_k] = ss.get(_k, _cache0.get(_k, _d))
+for _k, _opts in SETTING_CHOICES.items():
+    if ss[_k] not in _opts:
+        ss[_k] = SETTING_DEFAULTS[_k]
+
+
+# =============================================================================
 # 8. SIDEBAR
 # =============================================================================
 with st.sidebar:
     st.title("🌾 SKP 2026")
     st.caption("Asisten Cleaning Data · Tim SKP BPS Kab/Kota")
-    menu = st.radio("Menu", [MENU_MAIN, MENU_PROV], label_visibility="collapsed")
+    menu = st.radio("Menu", [MENU_MAIN, MENU_PROV], key="menu_sel", label_visibility="collapsed")
+    with st.expander("💾 Penyimpanan otomatis"):
+        st.caption(
+            "Data unggahan, edit, justifikasi, draft, dan pengaturan tersimpan otomatis di server. "
+            "Bila halaman ter-refresh, URL yang sama (memuat `?ws=ID`) memulihkan semuanya tanpa unggah ulang. "
+            "Simpan/bookmark URL ini; siapa pun yang memegang URL dapat membuka ruang kerja ini.")
+        st.code(ss.get("ws_id", ""), language=None)
+        STORE_PH = st.empty()
+        STORE_PH.caption("Belum ada data yang disimpan.")
+        if ss.get("_ws_err"):
+            st.error(ss["_ws_err"])
+            st.button("Mulai ruang kerja baru", on_click=ws_new, key="ws_newb",
+                      help="Penyimpanan lama tidak dihapus; hanya sesi ini yang beralih ke ruang kerja baru.")
+        st.text_input("Buka ruang kerja lain (ID)", key="ws_other")
+        st.button("Buka ruang kerja", on_click=ws_switch, key="ws_open")
 
 if menu == MENU_PROV:
     render_prov_page()
+    persist()
     st.stop()
 
 with st.sidebar:
@@ -1343,40 +1769,43 @@ with st.sidebar:
             sig = (up.name, up.size, sheet)
             if ss.sig != sig:
                 reset_state(sig, read_upload(up.name, up.getvalue(), sheet))
+                persist()               # simpan data unggahan segera (sekali), agar aman bila langsung ter-refresh
         except Exception as e:
             st.error(f"Gagal membaca file: {e}")
     elif ss.demo and ss.sig != ("demo",):
         reset_state(("demo",), make_demo())
+    if up is None and ss.raw is not None and not ss.demo and ss.sig:
+        st.caption(f"📂 Data aktif: **{ss.sig[0]}**. Tersimpan otomatis di server; tidak perlu unggah ulang.")
 
     st.divider()
     st.subheader("📝 Catatan standar")
-    std_note = st.text_input("Catatan standar", value=DEFAULT_STD, key="std_note",
+    std_note = st.text_input("Catatan standar", key="std_note",
                              help="Contoh: Sesuai Kondisi Lapangan dan Penuturan Responden")
-    use_std = st.checkbox("Isi otomatis ke kolom penjelasan", value=True, key="use_std",
+    use_std = st.checkbox("Isi otomatis ke kolom penjelasan", key="use_std",
                           help="Dipakai sebagai isian awal penjelasan bila belum ada penjelasan tersimpan. Tetap bisa diedit.")
     st.divider()
     st.subheader("⚙️ Parameter deteksi")
     only_elig = st.checkbox(
-        "Hanya status APPROVED BY Pengawas / REVOKED BY Admin", value=True,
+        "Hanya status APPROVED BY Pengawas / REVOKED BY Admin", key="only_elig",
         help="Sesuai pedoman, hanya data berstatus tersebut yang dapat di-cleaning. Berlaku jika kolom status dipetakan.",
     )
     with st.expander("Ambang batas anomali"):
         P = dict(DEFAULT_P)
-        P["jam_max"] = st.number_input("A_07: jam kerja maks/minggu", value=112, step=1)
+        P["jam_max"] = st.number_input("A_07: jam kerja maks/minggu", step=1, key="p_jam")
         P["upah_max"] = st.number_input(
-            "A_08: batas upah (R329 ≤ nilai)", value=1_000_000, step=100_000,
+            "A_08: batas upah (R329 ≤ nilai)", step=100_000, key="p_upah",
             help="Pedoman menulis kondisi R329 <= 1000 namun deskripsi menyebut Rp 1.000.000. "
                  "Sesuaikan dengan satuan isian R329 pada data Anda.")
-        P["rasio_lantai"] = st.number_input("A_13: luas lantai per ART (m²)", value=3.6, step=0.1)
-        P["listrik_max"] = st.number_input("A_18: pengeluaran listrik (ribu rupiah)", value=25, step=1)
-        P["tani_max"] = st.number_input("A_19: pendapatan tani maks (ribu rupiah)", value=1_000_000, step=100_000)
+        P["rasio_lantai"] = st.number_input("A_13: luas lantai per ART (m²)", step=0.1, key="p_rasio")
+        P["listrik_max"] = st.number_input("A_18: pengeluaran listrik (ribu rupiah)", step=1, key="p_listrik")
+        P["tani_max"] = st.number_input("A_19: pendapatan tani maks (ribu rupiah)", step=100_000, key="p_tani")
     with st.expander("Metode outlier"):
-        P["method"] = st.radio("Metode", ["IQR", "Modified Z-score"], horizontal=True)
+        P["method"] = st.radio("Metode", ["IQR", "Modified Z-score"], horizontal=True, key="p_method")
         if P["method"] == "IQR":
-            P["k_iqr"] = st.slider("Pengali IQR", 1.0, 6.0, 3.0, 0.5)
+            P["k_iqr"] = st.slider("Pengali IQR", 1.0, 6.0, step=0.5, key="p_kiqr")
         else:
-            P["k_z"] = st.slider("Ambang |z|", 2.0, 8.0, 3.5, 0.5)
-        P["ignore_zero"] = st.checkbox("Abaikan nilai 0 saat menghitung batas", value=True)
+            P["k_z"] = st.slider("Ambang |z|", 2.0, 8.0, step=0.5, key="p_kz")
+        P["ignore_zero"] = st.checkbox("Abaikan nilai 0 saat menghitung batas", key="p_zero")
         st.caption("Pedoman merujuk dashboard FASIH untuk daftar outlier resmi; "
                    "metode ini hanya pendekatan pembantu bila dashboard belum tersedia.")
 
@@ -1395,6 +1824,7 @@ if ss.raw is None:
         "Format data: satu baris = satu RTUP, atau satu baris = satu ART dengan kolom "
         "**ID RTUP/assignment** yang sama berulang. Gunakan **Template** untuk nama kolom yang dikenali otomatis."
     )
+    persist()
     st.stop()
 
 tab_map, tab_dash, tab_review, tab_out, tab_guide = st.tabs(
@@ -1411,20 +1841,24 @@ with tab_map:
                "Aturan yang kolomnya belum dipetakan akan dilewati.")
     cols = list(raw.columns)
     ncol = {norm(c): c for c in cols}
-    NONE = "(tidak ada)"
+    NONE = NONE_LBL
     mapping = {}
     groups_f = {}
     for key, label, grp, aliases in FIELDS:
         groups_f.setdefault(grp, []).append((key, label, aliases))
     sigk = str(ss.sig)
+    mc = ss.get("_map_cache", {})      # pemetaan tersimpan (dipulihkan setelah refresh)
     for grp, items in groups_f.items():
         with st.expander(grp, expanded=(grp.startswith("Identitas"))):
             cc = st.columns(2)
             for n, (key, label, aliases) in enumerate(items):
                 guess = next((ncol[a] for a in [key] + aliases if a in ncol), None)
                 opts = [NONE] + cols
-                idx = opts.index(guess) if guess in opts else 0
-                sel = cc[n % 2].selectbox(label, opts, index=idx, key=f"map_{key}_{sigk}")
+                k_ = f"map_{key}_{sigk}"
+                if k_ not in ss:
+                    pref = mc.get(key)
+                    ss[k_] = pref if pref in opts else (guess if guess in opts else NONE)
+                sel = cc[n % 2].selectbox(label, opts, key=k_)
                 mapping[key] = None if sel == NONE else sel
     n_map = sum(1 for k, v in mapping.items() if v)
     st.success(f"{n_map} dari {len(FIELDS)} field terpetakan.")
@@ -1433,6 +1867,7 @@ if not mapping.get("id"):
     for t in (tab_dash, tab_review, tab_out):
         with t:
             st.warning("Petakan kolom **ID RTUP / Assignment** pada tab *Data & Kolom* terlebih dahulu.")
+    persist(mapping)
     st.stop()
 
 # ---------------------------------------------------------------- PERHITUNGAN
@@ -1595,6 +2030,7 @@ with tab_review:
                     nchg += 1
             ss.ver += 1
             ss.flash = f"{nchg} sel berhasil diperbarui." if nchg else "Tidak ada perubahan."
+            persist(mapping)
             st.rerun()
 
         # ---- C. justifikasi
@@ -1626,6 +2062,7 @@ with tab_review:
                     else:
                         ss.just[(sel, k)] = {"status": stt, "text": txt}
                 ss.flash = "Justifikasi tersimpan."
+                persist(mapping)
                 st.rerun()
             for k in g["kode"]:
                 j = ss.just.get((sel, k))
@@ -1649,12 +2086,14 @@ with tab_review:
                     st.error("Isi nomor anomali (angka).")
                 else:
                     ss.bfl.setdefault(sel, []).append(dict(kode=f"B_{digits_.zfill(2)}", status=bst, text=btx.strip()))
+                    persist(mapping)
                     st.rerun()
             for n_, b in enumerate(ss.bfl.get(sel, [])):
                 x1, x2 = st.columns([6, 1])
                 x1.code(f"#{b['kode']}: {b['status']}# {b['text']}".strip(), language=None)
                 if x2.button("🗑️", key=f"bdel_{sel}_{n_}"):
                     ss.bfl[sel].pop(n_)
+                    persist(mapping)
                     st.rerun()
 
         # ---- E. teks catatan
@@ -1746,3 +2185,6 @@ Untuk anomali/outlier yang dilakukan mandiri oleh BPS Provinsi: `#B_[Nomor anoma
     st.subheader("Daftar outlier")
     render_wrap(pd.DataFrame({"Kode": list(OUTLIER_DESC), "Deskripsi": list(OUTLIER_DESC.values())}),
                 key="guide_o", widths={"Deskripsi": "85%"}, size=100)
+
+# simpan otomatis keadaan terakhir (hanya menulis bila ada perubahan)
+persist(mapping)
