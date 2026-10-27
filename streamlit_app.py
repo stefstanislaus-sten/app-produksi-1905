@@ -485,11 +485,383 @@ def to_excel(sheets: dict) -> bytes:
 
 
 # =============================================================================
+# 7b. MENU TEMPLATE PROVINSI (flag B_xx / A_xx / O_xx dari BPS Provinsi)
+# =============================================================================
+MENU_MAIN = "🧹 Cleaning Data Lapangan"
+MENU_PROV = "🗂️ Template Provinsi (flag B_xx)"
+
+PROV_PATTERNS = [
+    ("link", r"^link"), ("kab", r"r102"), ("kec", r"r103"), ("desa", r"r104"), ("sls", r"r107"),
+    ("krt", r"r110"), ("no_art", r"r302"), ("nama_art", r"r303"), ("jml_art", r"r301"),
+    ("kode", r"kodeflag"), ("var", r"namavariabel"), ("kondisi", r"kondisianomali"),
+    ("deskripsi", r"deskripsianomali"), ("catatan", r"^catatan"), ("no", r"^no$"),
+    ("blok", r"^blok$"), ("rincian", r"^rincian$"), ("ppl", r"^ppl$"), ("pml", r"^pml$"),
+    ("tindak", r"tindaklanjut"), ("ket", r"keteranganperbaikan"),
+]
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def norm_kode(v) -> str:
+    s = str(v).strip().upper()
+    m = re.fullmatch(r"\[?([ABO])[\s_\-]?(\d{1,3})\]?", s)
+    return f"{m.group(1)}_{int(m.group(2)):02d}" if m else s
+
+
+def kode_valid(k: str) -> bool:
+    if k.startswith("B_"):
+        return bool(re.fullmatch(r"B_\d{2,3}", k))
+    return k in FLAG_DESC
+
+
+def prov_note(kode: str, status: str, text: str) -> str:
+    """Format sesuai pedoman: A/O -> #[A_08]: Status# ; B -> #B_01: Status#"""
+    head = f"#{kode}: {status}#" if kode.startswith("B_") or not kode_valid(kode) else f"#[{kode}]: {status}#"
+    return f"{head} {(text or '').strip()}".strip()
+
+
+def prov_read_text(text: str) -> pd.DataFrame:
+    first = text.splitlines()[0] if text.strip() else ""
+    sep = "\t" if "\t" in first else (";" if first.count(";") > first.count(",") else ",")
+    return pd.read_csv(io.StringIO(text), sep=sep, dtype=str, keep_default_na=False,
+                       engine="python", on_bad_lines="skip")
+
+
+def prov_read(content: bytes, name: str) -> pd.DataFrame:
+    if name.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(content), dtype=str)
+    else:
+        if content[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            text = content.decode("utf-16")
+        else:
+            try:
+                text = content.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = content.decode("cp1252", errors="replace")
+        df = prov_read_text(text)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.fillna("").astype(str)
+
+
+def prov_prepare(df: pd.DataFrame):
+    M, used = {}, set()
+    for key, pat in PROV_PATTERNS:
+        for c in df.columns:
+            if c not in used and re.search(pat, norm(c)):
+                M[key] = c
+                used.add(c)
+                break
+    df = df.copy()
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.strip()
+    if "kode" in M:
+        df = df[(df[M["kode"]] != "") | (df[M["link"]] != "" if "link" in M else False)]
+    df = df.reset_index(drop=True)
+
+    def aid(i):
+        lk = df.at[i, M["link"]] if "link" in M else ""
+        m = UUID_RE.search(lk)
+        if m:
+            return m.group(0).lower()
+        if lk:
+            return lk
+        return "|".join(df.at[i, M[k]] for k in ("krt", "sls") if k in M) or f"baris{i}"
+
+    df["_aid"] = [aid(i) for i in df.index]
+    df["_kode"] = df[M["kode"]].map(norm_kode) if "kode" in M else ""
+    return df, M
+
+
+def render_prov_page():
+    st.title("Template Flagging BPS Provinsi")
+    st.caption(
+        "Olah daftar flag dari BPS Provinsi (kolom: Kode Flag, Nama Variabel & Nilainya, Kondisi Anomali, "
+        "Catatan petugas, dst.) menjadi teks **Keterangan Perbaikan/kode flag** sesuai pedoman: "
+        "`#B_24: Sesuai Kondisi Lapangan# penjelasan`."
+    )
+    ss.setdefault("prov_sig", None)
+    ss.setdefault("prov_df", None)
+    ss.setdefault("prov_map", {})
+    ss.setdefault("prov_just", {})
+    ss.setdefault("prov_gen", 0)
+    ss.setdefault("prov_ver", 0)
+    ss.setdefault("prov_flash", None)
+
+    with st.sidebar:
+        st.subheader("⚙️ Pengaturan template")
+        tl_done = st.text_input("Isi kolom 'Tindak Lanjut' jika flag selesai", value="Sudah diperiksa",
+                                help="Disesuaikan dengan pilihan dropdown di template Anda.")
+        prefill = st.checkbox("Isi penjelasan otomatis dari Catatan (petugas)", value=True)
+        st.caption("Penjelasan tetap bisa Anda ubah sebelum disimpan.")
+
+    up = st.file_uploader("Unggah template provinsi (TXT / TSV / CSV / XLSX)", type=["txt", "tsv", "csv", "xlsx", "xls"], key="prov_up")
+    with st.expander("…atau tempel langsung dari Excel (termasuk baris judul kolom)"):
+        pasted = st.text_area("Tempel di sini", height=120, key="prov_paste")
+    try:
+        if up is not None:
+            sig = ("f", up.name, up.size)
+            raw_df = prov_read(up.getvalue(), up.name) if ss.prov_sig != sig else None
+        elif pasted.strip():
+            sig = ("p", hash(pasted))
+            raw_df = prov_read_text(pasted).fillna("").astype(str) if ss.prov_sig != sig else None
+        else:
+            sig, raw_df = None, None
+        if sig is not None and raw_df is not None:
+            raw_df.columns = [str(c).strip() for c in raw_df.columns]
+            d, M = prov_prepare(raw_df)
+            ss.prov_sig, ss.prov_df, ss.prov_map = sig, d, M
+            ss.prov_just, ss.prov_ver = {}, 0
+            ss.prov_gen += 1
+    except Exception as e:
+        st.error(f"Gagal membaca template: {e}")
+
+    if ss.prov_df is None:
+        st.info("Unggah atau tempel template provinsi untuk mulai.")
+        return
+    df, M = ss.prov_df, ss.prov_map
+    if "kode" not in M:
+        st.error("Kolom **Kode Flag** tidak ditemukan. Pastikan baris pertama berisi judul kolom sesuai template.")
+        st.write("Kolom terbaca:", list(df.columns))
+        return
+    if df.empty:
+        st.warning("Tidak ada baris data.")
+        return
+
+    ver = f"{ss.prov_gen}_{ss.prov_ver}"
+    get = lambda r, k: (r[M[k]] if k in M else "")  # noqa: E731
+    missing = [k for k in ("link", "krt", "var", "kondisi", "deskripsi", "catatan", "ppl", "ket") if k not in M]
+    if missing:
+        st.caption("Kolom opsional tidak ditemukan: " + ", ".join(missing))
+    if ss.prov_flash:
+        st.success(ss.prov_flash)
+        ss.prov_flash = None
+
+    def stat(i):
+        return ss.prov_just.get(i, {}).get("status")
+
+    # ---------------- filter
+    with st.expander("🔎 Filter", expanded=True):
+        fc = st.columns(4)
+        mask = pd.Series(True, index=df.index)
+        for n, (k, lab) in enumerate([("ppl", "PPL"), ("pml", "PML"), ("kec", "Kecamatan"), ("desa", "Desa/Kel."),
+                                      ("blok", "Blok"), ("kode", "Kode flag")]):
+            if k not in M:
+                continue
+            colname = "_kode" if k == "kode" else M[k]
+            opts = sorted(x for x in df[colname].unique() if x)
+            pick = fc[n % 4].multiselect(lab, opts, key=f"pf_{k}_{ver}")
+            if pick:
+                mask &= df[colname].isin(pick)
+        sc = st.columns([1, 2])
+        stf = sc[0].radio("Status", ["Semua", "Belum diisi", "Sudah diisi"], horizontal=True)
+        q = sc[1].text_input("Cari nama KRT / rincian / catatan")
+        if stf == "Belum diisi":
+            mask &= ~df.index.to_series().map(lambda i: bool(stat(i)))
+        elif stf == "Sudah diisi":
+            mask &= df.index.to_series().map(lambda i: bool(stat(i)))
+        if q:
+            hay = df[[M[k] for k in ("krt", "rincian", "catatan", "var") if k in M]].agg(" ".join, axis=1)
+            mask &= hay.str.contains(q, case=False, regex=False)
+    sub = df[mask]
+
+    n_done = sum(1 for i in df.index if stat(i))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Baris flag", f"{len(df):,}")
+    m2.metric("RTUP unik", f"{df['_aid'].nunique():,}")
+    m3.metric("Sudah diisi", f"{n_done:,}")
+    m4.metric("Progres", f"{n_done / len(df) * 100:.0f}%")
+
+    t_tab, t_rt, t_out, t_sum = st.tabs(["📋 Mode tabel (cepat)", "🏠 Mode per RTUP", "📥 Hasil & Unduh", "📊 Ringkasan"])
+
+    # ---------------- MODE TABEL
+    with t_tab:
+        st.caption(f"{len(sub):,} baris tampil. Pilih **Justifikasi** dan isi **Penjelasan**, lalu klik Simpan.")
+        b1, b2, b3 = st.columns([2, 2, 1])
+        bulk = b1.selectbox("Isi massal baris terfilter yang belum diisi", STATUS_OPTS[1:], key=f"bulk_{ver}")
+        b2.caption("Penjelasan diambil dari Catatan (petugas). Periksa dulu sebelum dipakai.")
+        if b3.button("Terapkan", key=f"bulkb_{ver}"):
+            n = 0
+            for i in sub.index:
+                if not stat(i):
+                    ss.prov_just[i] = {"status": bulk, "text": get(df.loc[i], "catatan") if prefill else ""}
+                    n += 1
+            ss.prov_ver += 1
+            ss.prov_flash = f"{n} baris diisi '{bulk}'."
+            st.rerun()
+        view = pd.DataFrame(index=sub.index)
+        view["Nama KRT"] = sub[M["krt"]] if "krt" in M else ""
+        view["Kode"] = sub["_kode"]
+        view["Rincian"] = sub[M["rincian"]] if "rincian" in M else ""
+        view["Variabel & nilai"] = sub[M["var"]] if "var" in M else ""
+        view["Deskripsi anomali"] = sub[M["deskripsi"]] if "deskripsi" in M else ""
+        view["Catatan (petugas)"] = sub[M["catatan"]] if "catatan" in M else ""
+        view["Justifikasi"] = [ss.prov_just.get(i, {}).get("status", STATUS_PLACEHOLDER) for i in sub.index]
+        view["Penjelasan"] = [
+            ss.prov_just[i]["text"] if i in ss.prov_just else (get(df.loc[i], "catatan") if prefill else "")
+            for i in sub.index
+        ]
+        ed = st.data_editor(
+            view, key=f"pted_{ver}",
+            disabled=[c for c in view.columns if c not in ("Justifikasi", "Penjelasan")],
+            column_config={"Justifikasi": st.column_config.SelectboxColumn(options=STATUS_OPTS, required=True),
+                           "Penjelasan": st.column_config.TextColumn(width="large")},
+        )
+        if st.button("💾 Simpan tabel", key=f"ptsave_{ver}"):
+            for i in ed.index:
+                s_ = ed.at[i, "Justifikasi"]
+                if s_ and s_ != STATUS_PLACEHOLDER:
+                    ss.prov_just[i] = {"status": s_, "text": str(ed.at[i, "Penjelasan"] or "").strip()}
+                else:
+                    ss.prov_just.pop(i, None)
+            ss.prov_flash = "Tabel tersimpan."
+            ss.prov_ver += 1
+            st.rerun()
+
+    # ---------------- MODE PER RTUP
+    with t_rt:
+        groups = {a: g.index.tolist() for a, g in sub.groupby("_aid", sort=False)}
+        if not groups:
+            st.info("Tidak ada RTUP pada filter ini.")
+        else:
+            def lbl(a):
+                ids = groups[a]
+                d = sum(1 for i in ids if stat(i))
+                r0 = df.loc[ids[0]]
+                return f"{'✅' if d == len(ids) else '⏳'} {get(r0, 'krt') or a} · {get(r0, 'desa')} · {len(ids)} flag ({d} selesai)"
+
+            sel = st.selectbox("Pilih RTUP (ketik untuk mencari)", list(groups), format_func=lbl, key=f"prsel_{ver}")
+            ids = groups[sel]
+            r0 = df.loc[ids[0]]
+            st.markdown(
+                f"**{get(r0, 'krt')}** — {get(r0, 'kab')} / {get(r0, 'kec')} / {get(r0, 'desa')} / {get(r0, 'sls')} "
+                f"· ART: {get(r0, 'jml_art')} · PPL: {get(r0, 'ppl')} · PML: {get(r0, 'pml')}"
+            )
+            if get(r0, "link").startswith("http"):
+                st.link_button("🔗 Buka assignment di FASIH SM", get(r0, "link"))
+            if st.button("Tandai semua yang belum diisi: 'Sesuai Kondisi Lapangan' (pakai catatan petugas)", key=f"prall_{sel}_{ver}"):
+                for i in ids:
+                    if not stat(i):
+                        ss.prov_just[i] = {"status": "Sesuai Kondisi Lapangan", "text": get(df.loc[i], "catatan") if prefill else ""}
+                ss.prov_ver += 1
+                st.rerun()
+            with st.form(f"prf_{sel}_{ver}"):
+                for i in ids:
+                    r = df.loc[i]
+                    st.markdown(f"**{r['_kode']}** · {get(r, 'blok')} {get(r, 'rincian')} — {get(r, 'deskripsi')}")
+                    st.text(f"Variabel: {get(r, 'var')}   |   Kondisi: {get(r, 'kondisi')}")
+                    st.text(f"Catatan petugas: {get(r, 'catatan')}")
+                    sv = ss.prov_just.get(i, {})
+                    a, b = st.columns([1, 2])
+                    a.selectbox("Justifikasi", STATUS_OPTS, index=STATUS_OPTS.index(sv.get("status", STATUS_PLACEHOLDER)), key=f"pst_{i}_{ver}")
+                    b.text_area("Penjelasan", value=sv["text"] if sv else (get(r, "catatan") if prefill else ""), key=f"ptx_{i}_{ver}", height=90)
+                ok = st.form_submit_button("💾 Simpan RTUP ini")
+            if ok:
+                for i in ids:
+                    s_, t_ = ss[f"pst_{i}_{ver}"], ss[f"ptx_{i}_{ver}"].strip()
+                    if s_ == STATUS_PLACEHOLDER:
+                        ss.prov_just.pop(i, None)
+                    else:
+                        ss.prov_just[i] = {"status": s_, "text": t_}
+                ss.prov_flash = "Tersimpan."
+                st.rerun()
+            lines = [prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"]) for i in ids if i in ss.prov_just]
+            st.markdown("**Teks untuk Blok Catatan Anomali (FASIH SM)**")
+            if lines:
+                st.code("\n".join(lines), language=None)
+            else:
+                st.caption("Belum ada justifikasi tersimpan.")
+
+    # ---------------- HASIL
+    with t_out:
+        issues = []
+        for i in df.index:
+            k, j = df.at[i, "_kode"], ss.prov_just.get(i)
+            if not kode_valid(k):
+                issues.append((i + 2, k, "Kode flag tidak sesuai daftar/format pedoman (A_01–A_21, O_01–O_14, B_xx)"))
+            if not j:
+                issues.append((i + 2, k, "Belum ada justifikasi"))
+                continue
+            if j["status"] in ("Diperbaiki", "Sesuai Kondisi Lapangan") and not j["text"]:
+                issues.append((i + 2, k, "Penjelasan hasil konfirmasi kosong"))
+            if j["status"] == "Diperbaiki" and j["text"] and not re.search(r"diganti|diubah|diperbaiki|menjadi|dikoreksi|direvisi", j["text"], re.I):
+                issues.append((i + 2, k, "Saran: sebutkan nilai/isian yang diperbaiki (mis. 'telah diganti menjadi …')"))
+            if k.startswith("B_") and j["status"] == "Non Respon":
+                issues.append((i + 2, k, "Pedoman format B_ hanya memuat Diperbaiki / Sesuai Kondisi Lapangan"))
+        iss = pd.DataFrame(issues, columns=["Baris di template", "Kode", "Catatan"])
+        n_block = int(iss["Catatan"].str.startswith(("Belum", "Penjelasan", "Kode")).sum()) if not iss.empty else 0
+        if n_block:
+            st.warning(f"{n_block} hal perlu dilengkapi sebelum dipakai.")
+        else:
+            st.success("Semua baris sudah terisi lengkap. ✅")
+        with st.expander(f"Validasi ({len(iss)})", expanded=bool(n_block)):
+            st.dataframe(iss)
+
+        out = df.drop(columns=["_aid", "_kode"]).copy()
+        ket = M.get("ket", "Keterangan Perbaikan/kode flag")
+        if ket not in out.columns:
+            out[ket] = ""
+        for i, j in ss.prov_just.items():
+            out.at[i, ket] = prov_note(df.at[i, "_kode"], j["status"], j["text"])
+            if "tindak" in M and tl_done:
+                out.at[i, M["tindak"]] = tl_done
+
+        rows = []
+        for a, g in df.groupby("_aid", sort=False):
+            ids = g.index.tolist()
+            d = [i for i in ids if i in ss.prov_just]
+            r0 = df.loc[ids[0]]
+            rows.append({
+                "id_assignment": a, "link": get(r0, "link"), "nama_krt": get(r0, "krt"), "desa": get(r0, "desa"),
+                "sls": get(r0, "sls"), "ppl": get(r0, "ppl"), "pml": get(r0, "pml"),
+                "jumlah_flag": len(ids), "selesai": len(d),
+                "status": "Lengkap" if len(d) == len(ids) else "Belum lengkap",
+                "catatan_anomali": "\n".join(prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"]) for i in d),
+            })
+        cat = pd.DataFrame(rows)
+        st.subheader("Catatan anomali per RTUP (siap tempel ke FASIH SM)")
+        st.dataframe(cat)
+        st.subheader("Template terisi")
+        st.dataframe(out)
+        d1, d2, d3 = st.columns(3)
+        d1.download_button(
+            "📥 Excel (template terisi + catatan per RTUP)",
+            to_excel({"Template_Terisi": out, "Catatan_per_RTUP": cat, "Validasi": iss}),
+            "template_provinsi_terisi.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        d2.download_button("📥 Template terisi (TSV, tempel ke Excel)", out.to_csv(sep="\t", index=False).encode("utf-8-sig"),
+                           "template_provinsi_terisi.tsv", "text/tab-separated-values")
+        d3.download_button("📥 Catatan per RTUP (CSV)", cat.to_csv(index=False).encode("utf-8-sig"),
+                           "catatan_per_rtup.csv", "text/csv")
+
+    # ---------------- RINGKASAN
+    with t_sum:
+        s1, s2 = st.columns(2)
+        s1.subheader("Jumlah per kode flag")
+        s1.bar_chart(df["_kode"].value_counts())
+        if "ppl" in M:
+            s2.subheader("Progres per PPL")
+            pp = df.assign(selesai=[bool(stat(i)) for i in df.index]).groupby(M["ppl"]).agg(
+                flag=("selesai", "size"), selesai=("selesai", "sum")).reset_index()
+            pp["progres"] = pp["selesai"] / pp["flag"]
+            s2.dataframe(pp, column_config={"progres": st.column_config.ProgressColumn("progres", min_value=0, max_value=1, format="percent")})
+        if "rincian" in M:
+            st.subheader("Rincian paling sering terflag")
+            st.dataframe(df.groupby([c for c in (M.get("blok"), M["rincian"]) if c]).size().sort_values(ascending=False).head(20).rename("jumlah").reset_index())
+
+
+# =============================================================================
 # 8. SIDEBAR
 # =============================================================================
 with st.sidebar:
     st.title("🌾 SKP 2026")
     st.caption("Asisten Cleaning Data · Tim SKP BPS Kab/Kota")
+    menu = st.radio("Menu", [MENU_MAIN, MENU_PROV], label_visibility="collapsed")
+
+if menu == MENU_PROV:
+    render_prov_page()
+    st.stop()
+
+with st.sidebar:
     up = st.file_uploader("Unggah data SKP (CSV / Excel)", type=["csv", "xlsx", "xls"])
     sheet = None
     if up is not None and not up.name.lower().endswith(".csv"):
