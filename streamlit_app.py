@@ -497,6 +497,21 @@ def reset_rtup(sel, idc):
     ss.toast = f"RTUP {sel} direset ke kondisi awal."
 
 
+def apply_all_rtup(sel, kodes, status_key, overwrite_key, std_default):
+    """Terapkan satu justifikasi ke semua flag pada RTUP terpilih."""
+    status, overwrite = ss[status_key], ss[overwrite_key]
+    n = 0
+    for k in kodes:
+        old = ss.just.get((sel, k), {})
+        if old.get("status") and not overwrite:
+            continue
+        ss.just[(sel, k)] = {"status": status, "text": old.get("text") or std_default}
+        n += 1
+    for key in [x for x in list(ss.keys()) if isinstance(x, str) and x.startswith((f"st_{sel}_", f"tx_{sel}_"))]:
+        del ss[key]
+    ss.toast = f"{n} flag pada RTUP {sel} diset '{status}'."
+
+
 def reset_all():
     """Hapus semua data & isian (mulai dari awal)."""
     ss.raw = ss.work = ss.sig = None
@@ -558,6 +573,11 @@ TPL_NO = ("Memang rumah tangga ini #Deskripsi anomali, hal ini sesuai penuturan 
           "saat konfirmasi ulang dengan PPL yang bersangkutan.")
 TPL_YES = ("Memang rumah tangga ini #Deskripsi anomali #variabel_dan_nilai, hal ini sesuai penuturan responden "
            "saat konfirmasi ulang dengan PPL yang bersangkutan.")
+TPL_FIX_NO = ("Hasil konfirmasi ulang dengan PPL yang bersangkutan, kondisi rumah tangga ini yang semula tercatat "
+              "#Deskripsi anomali ternyata keliru dan telah diperbaiki menjadi [isi nilai baru].")
+TPL_FIX_YES = ("Hasil konfirmasi ulang dengan PPL yang bersangkutan, kondisi rumah tangga ini yang semula tercatat "
+               "#Deskripsi anomali #variabel_dan_nilai ternyata keliru dan telah diperbaiki menjadi [isi nilai baru].")
+PLACEHOLDER_BARU = "[isi nilai baru]"
 NILAI_MODES = ["Otomatis (pakai nilai bila variabel berupa angka besar)", "Selalu tanpa nilai", "Selalu dengan nilai"]
 PROV_MODES = ["Template catatan default", "Catatan petugas + catatan standar", "Catatan standar saja",
               "Catatan petugas saja", "Kosongkan"]
@@ -599,7 +619,12 @@ def clean_desk(desk: str) -> str:
     return d
 
 
-def render_default_catatan(desk, var, cat, tpl_no=TPL_NO, tpl_yes=TPL_YES, nmode=NILAI_MODES[0]) -> str:
+def render_default_catatan(desk, var, cat, tpl_no=TPL_NO, tpl_yes=TPL_YES, nmode=NILAI_MODES[0],
+                           status="Sesuai Kondisi Lapangan", tpl_fno=TPL_FIX_NO, tpl_fyes=TPL_FIX_YES) -> str:
+    if status == "Non Respon":
+        return ""
+    if status == "Diperbaiki":
+        tpl_no, tpl_yes = tpl_fno, tpl_fyes
     d = clean_desk(desk)
     if not d:
         return (cat or "").strip()
@@ -618,10 +643,11 @@ def render_default_catatan(desk, var, cat, tpl_no=TPL_NO, tpl_yes=TPL_YES, nmode
 
 
 def auto_text(cat: str, std: str, mode: str, desk: str = "", var: str = "",
-              tpl_no: str = TPL_NO, tpl_yes: str = TPL_YES, nmode: str = NILAI_MODES[0]) -> str:
+              tpl_no: str = TPL_NO, tpl_yes: str = TPL_YES, nmode: str = NILAI_MODES[0],
+              status: str = "Sesuai Kondisi Lapangan", tpl_fno: str = TPL_FIX_NO, tpl_fyes: str = TPL_FIX_YES) -> str:
     cat, std = (cat or "").strip(), (std or "").strip()
     if mode == PROV_MODES[0]:
-        return render_default_catatan(desk, var, cat, tpl_no, tpl_yes, nmode)
+        return render_default_catatan(desk, var, cat, tpl_no, tpl_yes, nmode, status, tpl_fno, tpl_fyes)
     if mode == PROV_MODES[1]:
         if cat and std:
             return f"{cat}{'' if cat[-1] in '.!?' else '.'} {std}"
@@ -636,6 +662,8 @@ def auto_text(cat: str, std: str, mode: str, desk: str = "", var: str = "",
 def prov_reset_tpl():
     ss["prov_tpl_no"] = TPL_NO
     ss["prov_tpl_yes"] = TPL_YES
+    ss["prov_tpl_fno"] = TPL_FIX_NO
+    ss["prov_tpl_fyes"] = TPL_FIX_YES
     ss["prov_nmode"] = NILAI_MODES[0]
     ss.toast = "Template catatan dikembalikan ke bawaan."
 
@@ -760,8 +788,12 @@ def render_prov_page():
                             help="Contoh: Sesuai Kondisi Lapangan dan Penuturan Responden")
         mode = st.radio("Isi penjelasan otomatis dengan", PROV_MODES, key="prov_mode")
         with st.expander("🧩 Template catatan default"):
+            st.markdown("**Sesuai Kondisi Lapangan**")
             tpl_no = st.text_area("Template tanpa nilai", value=TPL_NO, key="prov_tpl_no", height=120)
             tpl_yes = st.text_area("Template dengan nilai", value=TPL_YES, key="prov_tpl_yes", height=120)
+            st.markdown("**Diperbaiki**")
+            tpl_fno = st.text_area("Template tanpa nilai ", value=TPL_FIX_NO, key="prov_tpl_fno", height=120)
+            tpl_fyes = st.text_area("Template dengan nilai ", value=TPL_FIX_YES, key="prov_tpl_fyes", height=120)
             nmode = st.radio("Pemakaian nilai", NILAI_MODES, key="prov_nmode")
             st.caption("Token: **#Deskripsi anomali**, **#variabel_dan_nilai**, **#catatan_petugas**. "
                        "Awalan 'Ruta'/'Nilai' pada deskripsi dibuang otomatis; nilai dalam ribu rupiah "
@@ -773,8 +805,17 @@ def render_prov_page():
                       help="Mengosongkan semua justifikasi & penjelasan; template tetap termuat.")
             st.button("Reset semua (hapus template)", on_click=prov_reset_all, key="prov_r2",
                       help="Menghapus template yang termuat beserta seluruh isian.")
-    auto = lambda r: auto_text(get(r, "catatan"), std, mode, get(r, "deskripsi"), get(r, "var"), tpl_no, tpl_yes, nmode)  # noqa: E731
-    sk = abs(hash((std, mode, tpl_no, tpl_yes, nmode))) % 10**6
+    auto = lambda r, stt="Sesuai Kondisi Lapangan": auto_text(  # noqa: E731
+        get(r, "catatan"), std, mode, get(r, "deskripsi"), get(r, "var"), tpl_no, tpl_yes, nmode, stt, tpl_fno, tpl_fyes)
+    sk = abs(hash((std, mode, tpl_no, tpl_yes, nmode, tpl_fno, tpl_fyes))) % 10**6
+
+    def sync_text(r, stt, text):
+        """Kosong -> isi default sesuai justifikasi. Bila teks masih default milik justifikasi lain -> ganti ke default yang sesuai.
+        Teks yang sudah Anda ubah sendiri dipertahankan."""
+        t = (text or "").strip()
+        if not t:
+            return auto(r, stt)
+        return auto(r, stt) if t in {auto(r, x) for x in STATUS_OPTS[1:]} else t
 
     up = st.file_uploader("Unggah template provinsi (TXT / TSV / CSV / XLSX)", type=["txt", "tsv", "csv", "xlsx", "xls"], key=f"prov_up_{ss.prov_upv}")
     with st.expander("…atau tempel langsung dari Excel (termasuk baris judul kolom)"):
@@ -861,7 +902,10 @@ def render_prov_page():
         with st.expander("👁️ Pratinjau catatan default (3 baris pertama pada filter)"):
             for i in sub.index[:3]:
                 st.caption(f"{df.at[i, '_kode']} · {get(df.loc[i], 'krt')}")
+                st.markdown("_Sesuai Kondisi Lapangan_")
                 st.code(auto(df.loc[i]) or "(kosong)", language=None)
+                st.markdown("_Diperbaiki_")
+                st.code(auto(df.loc[i], "Diperbaiki") or "(kosong)", language=None)
         b1, b2, b3 = st.columns([2, 2, 1])
         bulk = b1.selectbox("Isi massal baris terfilter yang belum diisi", STATUS_OPTS[1:], index=1, key=f"bulk_{ver}")
         b2.caption("Penjelasan diisi sesuai mode otomatis di sidebar (default: template catatan). Periksa dulu sebelum dipakai.")
@@ -869,7 +913,7 @@ def render_prov_page():
             n = 0
             for i in sub.index:
                 if not stat(i):
-                    ss.prov_just[i] = {"status": bulk, "text": auto(df.loc[i])}
+                    ss.prov_just[i] = {"status": bulk, "text": auto(df.loc[i], bulk)}
                     n += 1
             ss.prov_ver += 1
             ss.prov_flash = f"{n} baris diisi '{bulk}'."
@@ -879,7 +923,7 @@ def render_prov_page():
             for i in sub.index:
                 j = ss.prov_just.get(i)
                 if j and not j["text"]:
-                    j["text"] = auto(df.loc[i])
+                    j["text"] = auto(df.loc[i], j["status"])
                     n += 1
             ss.prov_ver += 1
             ss.prov_flash = f"{n} penjelasan diisi."
@@ -909,7 +953,7 @@ def render_prov_page():
             for i in ed.index:
                 s_ = ed.at[i, "Justifikasi"]
                 if s_ and s_ != STATUS_PLACEHOLDER:
-                    ss.prov_just[i] = {"status": s_, "text": str(ed.at[i, "Penjelasan"] or "").strip()}
+                    ss.prov_just[i] = {"status": s_, "text": sync_text(df.loc[i], s_, str(ed.at[i, "Penjelasan"] or ""))}
                 else:
                     ss.prov_just.pop(i, None)
             ss.prov_flash = "Tabel tersimpan."
@@ -939,13 +983,23 @@ def render_prov_page():
                 lb1, lb2, _ = st.columns([1, 1, 2])
                 lb1.link_button("✏️ Buka mode edit di FASIH SM", edit_link(get(r0, "link"), survey_id), type="primary")
                 lb2.link_button("🔗 Buka detail", get(r0, "link"))
-            if st.button("Tandai semua yang belum diisi: 'Sesuai Kondisi Lapangan' (pakai catatan petugas)", key=f"prall_{sel}_{ver}"):
-                for i in ids:
-                    if not stat(i):
-                        ss.prov_just[i] = {"status": "Sesuai Kondisi Lapangan", "text": auto(df.loc[i])}
-                ss.prov_ver += 1
-                st.rerun()
             all_ids = df.index[df["_aid"] == sel].tolist()
+            st.markdown("**Terapkan justifikasi ke semua flag pada RTUP ini**")
+            ap1, ap2, ap3 = st.columns([2, 2, 1])
+            ap_st = ap1.selectbox("Pilih justifikasi", STATUS_OPTS[1:], index=1, key=f"aps_{sel}_{ver}")
+            ap_ow = ap2.checkbox("Ganti juga flag yang sudah terisi", value=True, key=f"apo_{sel}_{ver}",
+                                 help="Penjelasan yang Anda tulis sendiri dipertahankan; hanya penjelasan default yang disesuaikan dengan justifikasi baru.")
+            ap3.write("")
+            if ap3.button("Terapkan ke semua", key=f"apb_{sel}_{ver}"):
+                n = 0
+                for i in all_ids:
+                    if ap_ow or not stat(i):
+                        old = ss.prov_just.get(i, {}).get("text", "")
+                        ss.prov_just[i] = {"status": ap_st, "text": sync_text(df.loc[i], ap_st, old)}
+                        n += 1
+                ss.prov_ver += 1
+                ss.prov_flash = f"{n} flag pada RTUP ini diset '{ap_st}'."
+                st.rerun()
             st.button("🔄 Reset RTUP ini", on_click=prov_reset_rtup, args=(all_ids,), key=f"prrst_{sel}_{ver}",
                       help="Mengosongkan justifikasi dan penjelasan semua flag pada RTUP ini. RTUP lain tidak terpengaruh.")
             with st.form(f"prf_{sel}_{ver}"):
@@ -965,7 +1019,7 @@ def render_prov_page():
                     if s_ == STATUS_PLACEHOLDER:
                         ss.prov_just.pop(i, None)
                     else:
-                        ss.prov_just[i] = {"status": s_, "text": t_}
+                        ss.prov_just[i] = {"status": s_, "text": sync_text(df.loc[i], s_, t_)}
                 ss.prov_flash = "Tersimpan."
                 st.rerun()
             lines = [prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"]) for i in ids if i in ss.prov_just]
@@ -987,6 +1041,8 @@ def render_prov_page():
                 continue
             if j["status"] in ("Diperbaiki", "Sesuai Kondisi Lapangan") and not j["text"]:
                 issues.append((i + 2, k, "Penjelasan hasil konfirmasi kosong"))
+            if PLACEHOLDER_BARU in j["text"].lower():
+                issues.append((i + 2, k, f"Penjelasan masih memuat placeholder {PLACEHOLDER_BARU}: isi nilai perbaikan yang benar"))
             if j["status"] == "Diperbaiki" and j["text"] and not re.search(r"diganti|diubah|diperbaiki|menjadi|dikoreksi|direvisi", j["text"], re.I):
                 issues.append((i + 2, k, "Saran: sebutkan nilai/isian yang diperbaiki (mis. 'telah diganti menjadi …')"))
             if k.startswith("B_") and j["status"] == "Non Respon":
@@ -1351,6 +1407,13 @@ with tab_review:
         # ---- C. justifikasi
         if not g.empty:
             st.markdown("#### ② Justifikasi hasil konfirmasi")
+            ap1, ap2, ap3 = st.columns([2, 2, 1])
+            ap1.selectbox("Pilih justifikasi", STATUS_OPTS[1:], index=1, key=f"aps_{sel}")
+            ap2.checkbox("Ganti juga flag yang sudah terisi", value=True, key=f"apo_{sel}")
+            ap3.write("")
+            ap3.button("Terapkan ke semua", on_click=apply_all_rtup, key=f"apb_{sel}",
+                       args=(sel, tuple(g["kode"]), f"aps_{sel}", f"apo_{sel}", std_default),
+                       help="Menerapkan justifikasi terpilih ke semua flag RTUP ini. Penjelasan yang sudah ada dipertahankan; yang kosong diisi catatan standar.")
             with st.form(f"form_{sel}"):
                 for _, r in g.iterrows():
                     k = r["kode"]
