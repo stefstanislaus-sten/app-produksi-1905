@@ -554,20 +554,90 @@ def kode_valid(k: str) -> bool:
     return k in FLAG_DESC
 
 
-PROV_MODES = ["Catatan petugas + catatan standar", "Catatan standar saja", "Catatan petugas saja", "Kosongkan"]
+TPL_NO = ("Memang rumah tangga ini #Deskripsi anomali, hal ini sesuai penuturan responden "
+          "saat konfirmasi ulang dengan PPL yang bersangkutan.")
+TPL_YES = ("Memang rumah tangga ini #Deskripsi anomali #variabel_dan_nilai, hal ini sesuai penuturan responden "
+           "saat konfirmasi ulang dengan PPL yang bersangkutan.")
+NILAI_MODES = ["Otomatis (pakai nilai bila variabel berupa angka besar)", "Selalu tanpa nilai", "Selalu dengan nilai"]
+PROV_MODES = ["Template catatan default", "Catatan petugas + catatan standar", "Catatan standar saja",
+              "Catatan petugas saja", "Kosongkan"]
+
+_PAIR_RE = re.compile(r"([A-Za-z]\w*(?:\.\w+)*)\s*=\s*(-?[\d.,]+)")
 
 
-def auto_text(cat: str, std: str, mode: str) -> str:
+def _fmt_dec(x: float) -> str:
+    return f"{x:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def parse_var(var: str):
+    """Ambil (teks angka, angka) bila kolom 'Nama Variabel dan Nilainya' berisi tepat satu pasangan VAR = nilai."""
+    pairs = _PAIR_RE.findall(var or "")
+    if len(pairs) != 1:
+        return None
+    raw = pairs[0][1].rstrip(".,")
+    num = to_num_value(raw)
+    return None if np.isnan(num) else (raw, num)
+
+
+def fmt_var_nilai(var: str, desk: str) -> str:
+    """R617 = 10.600 (deskripsi memuat 'juta') -> 'sebesar 10,6 juta'; R411 = 170.000 -> 'sebesar 170.000'."""
+    p = parse_var(var)
+    if p is None:
+        return f"({var.strip()})" if (var or "").strip() else ""
+    _, num = p
+    if re.search(r"juta", desk or "", re.I) and abs(num) >= 1000:
+        return f"sebesar {_fmt_dec(num / 1000)} juta"
+    return "sebesar " + (fmt_num(num, 0) if float(num).is_integer() else _fmt_dec(num))
+
+
+def clean_desk(desk: str) -> str:
+    """'Ruta tidak memiliki kulkas' -> 'tidak memiliki kulkas'; 'Nilai pendapatan ...' -> 'pendapatan ...'"""
+    d = (desk or "").strip().rstrip(".,; ")
+    d = re.sub(r"^(?:(?:ruta|rumah\s+tangga|rt|nilai)\s+)+", "", d, flags=re.I)
+    if len(d) > 1 and d[0].isupper() and d[1].islower():
+        d = d[0].lower() + d[1:]
+    return d
+
+
+def render_default_catatan(desk, var, cat, tpl_no=TPL_NO, tpl_yes=TPL_YES, nmode=NILAI_MODES[0]) -> str:
+    d = clean_desk(desk)
+    if not d:
+        return (cat or "").strip()
+    nilai = fmt_var_nilai(var, desk)
+    p = parse_var(var)
+    quant = bool(p) and (abs(p[1]) >= 100 or bool(re.search(r"[.,]", p[0])))
+    use = nmode == NILAI_MODES[2] or (nmode == NILAI_MODES[0] and quant)
+    t = tpl_yes if (use and nilai) else tpl_no
+    t = re.sub(r"#\s*deskripsi[\s_]*anomali", lambda m: d, t, flags=re.I)
+    t = re.sub(r"#\s*variabel[\s_]*dan[\s_]*nilai(?:nya)?", lambda m: nilai, t, flags=re.I)
+    t = re.sub(r"#\s*catatan[\s_]*petugas", lambda m: (cat or "").strip(), t, flags=re.I)
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"\s+,", ",", t)
+    t = re.sub(r",\s*,", ",", t)
+    return t.strip()
+
+
+def auto_text(cat: str, std: str, mode: str, desk: str = "", var: str = "",
+              tpl_no: str = TPL_NO, tpl_yes: str = TPL_YES, nmode: str = NILAI_MODES[0]) -> str:
     cat, std = (cat or "").strip(), (std or "").strip()
     if mode == PROV_MODES[0]:
+        return render_default_catatan(desk, var, cat, tpl_no, tpl_yes, nmode)
+    if mode == PROV_MODES[1]:
         if cat and std:
             return f"{cat}{'' if cat[-1] in '.!?' else '.'} {std}"
         return cat or std
-    if mode == PROV_MODES[1]:
-        return std
     if mode == PROV_MODES[2]:
+        return std
+    if mode == PROV_MODES[3]:
         return cat
     return ""
+
+
+def prov_reset_tpl():
+    ss["prov_tpl_no"] = TPL_NO
+    ss["prov_tpl_yes"] = TPL_YES
+    ss["prov_nmode"] = NILAI_MODES[0]
+    ss.toast = "Template catatan dikembalikan ke bawaan."
 
 
 def prov_reset_input():
@@ -689,14 +759,22 @@ def render_prov_page():
         std = st.text_input("Catatan standar", value=DEFAULT_STD, key="prov_std",
                             help="Contoh: Sesuai Kondisi Lapangan dan Penuturan Responden")
         mode = st.radio("Isi penjelasan otomatis dengan", PROV_MODES, key="prov_mode")
+        with st.expander("🧩 Template catatan default"):
+            tpl_no = st.text_area("Template tanpa nilai", value=TPL_NO, key="prov_tpl_no", height=120)
+            tpl_yes = st.text_area("Template dengan nilai", value=TPL_YES, key="prov_tpl_yes", height=120)
+            nmode = st.radio("Pemakaian nilai", NILAI_MODES, key="prov_nmode")
+            st.caption("Token: **#Deskripsi anomali**, **#variabel_dan_nilai**, **#catatan_petugas**. "
+                       "Awalan 'Ruta'/'Nilai' pada deskripsi dibuang otomatis; nilai dalam ribu rupiah "
+                       "ditulis 'juta' bila deskripsi memuat kata juta (R617 = 10.600 → sebesar 10,6 juta).")
+            st.button("Kembalikan template ke bawaan", on_click=prov_reset_tpl, key="prov_rtpl")
         st.caption("Hasil otomatis tetap bisa Anda ubah sebelum disimpan.")
         with st.expander("🔄 Reset"):
             st.button("Reset isian justifikasi", on_click=prov_reset_input, key="prov_r1",
                       help="Mengosongkan semua justifikasi & penjelasan; template tetap termuat.")
             st.button("Reset semua (hapus template)", on_click=prov_reset_all, key="prov_r2",
                       help="Menghapus template yang termuat beserta seluruh isian.")
-    auto = lambda cat: auto_text(cat, std, mode)  # noqa: E731
-    sk = abs(hash((std, mode))) % 10**6
+    auto = lambda r: auto_text(get(r, "catatan"), std, mode, get(r, "deskripsi"), get(r, "var"), tpl_no, tpl_yes, nmode)  # noqa: E731
+    sk = abs(hash((std, mode, tpl_no, tpl_yes, nmode))) % 10**6
 
     up = st.file_uploader("Unggah template provinsi (TXT / TSV / CSV / XLSX)", type=["txt", "tsv", "csv", "xlsx", "xls"], key=f"prov_up_{ss.prov_upv}")
     with st.expander("…atau tempel langsung dari Excel (termasuk baris judul kolom)"):
@@ -780,14 +858,18 @@ def render_prov_page():
     # ---------------- MODE TABEL
     with t_tab:
         st.caption(f"{len(sub):,} baris tampil. Pilih **Justifikasi** dan isi **Penjelasan**, lalu klik Simpan.")
+        with st.expander("👁️ Pratinjau catatan default (3 baris pertama pada filter)"):
+            for i in sub.index[:3]:
+                st.caption(f"{df.at[i, '_kode']} · {get(df.loc[i], 'krt')}")
+                st.code(auto(df.loc[i]) or "(kosong)", language=None)
         b1, b2, b3 = st.columns([2, 2, 1])
         bulk = b1.selectbox("Isi massal baris terfilter yang belum diisi", STATUS_OPTS[1:], index=1, key=f"bulk_{ver}")
-        b2.caption("Penjelasan diisi sesuai pengaturan Catatan standar di sidebar. Periksa dulu sebelum dipakai.")
+        b2.caption("Penjelasan diisi sesuai mode otomatis di sidebar (default: template catatan). Periksa dulu sebelum dipakai.")
         if b3.button("Terapkan", key=f"bulkb_{ver}"):
             n = 0
             for i in sub.index:
                 if not stat(i):
-                    ss.prov_just[i] = {"status": bulk, "text": auto(get(df.loc[i], "catatan"))}
+                    ss.prov_just[i] = {"status": bulk, "text": auto(df.loc[i])}
                     n += 1
             ss.prov_ver += 1
             ss.prov_flash = f"{n} baris diisi '{bulk}'."
@@ -797,7 +879,7 @@ def render_prov_page():
             for i in sub.index:
                 j = ss.prov_just.get(i)
                 if j and not j["text"]:
-                    j["text"] = auto(get(df.loc[i], "catatan"))
+                    j["text"] = auto(df.loc[i])
                     n += 1
             ss.prov_ver += 1
             ss.prov_flash = f"{n} penjelasan diisi."
@@ -813,7 +895,7 @@ def render_prov_page():
             view["Link edit"] = [edit_link(get(df.loc[i], "link"), survey_id) for i in sub.index]
         view["Justifikasi"] = [ss.prov_just.get(i, {}).get("status", STATUS_PLACEHOLDER) for i in sub.index]
         view["Penjelasan"] = [
-            ss.prov_just[i]["text"] if i in ss.prov_just else (auto(get(df.loc[i], "catatan")))
+            ss.prov_just[i]["text"] if i in ss.prov_just else (auto(df.loc[i]))
             for i in sub.index
         ]
         ed = st.data_editor(
@@ -860,7 +942,7 @@ def render_prov_page():
             if st.button("Tandai semua yang belum diisi: 'Sesuai Kondisi Lapangan' (pakai catatan petugas)", key=f"prall_{sel}_{ver}"):
                 for i in ids:
                     if not stat(i):
-                        ss.prov_just[i] = {"status": "Sesuai Kondisi Lapangan", "text": auto(get(df.loc[i], "catatan"))}
+                        ss.prov_just[i] = {"status": "Sesuai Kondisi Lapangan", "text": auto(df.loc[i])}
                 ss.prov_ver += 1
                 st.rerun()
             all_ids = df.index[df["_aid"] == sel].tolist()
@@ -875,7 +957,7 @@ def render_prov_page():
                     sv = ss.prov_just.get(i, {})
                     a, b = st.columns([1, 2])
                     a.selectbox("Justifikasi", STATUS_OPTS, index=STATUS_OPTS.index(sv.get("status", STATUS_PLACEHOLDER)), key=f"pst_{i}_{ver}")
-                    b.text_area("Penjelasan", value=sv["text"] if sv else auto(get(r, "catatan")), key=f"ptx_{i}_{ver}_{sk}", height=90)
+                    b.text_area("Penjelasan", value=sv["text"] if sv else auto(r), key=f"ptx_{i}_{ver}_{sk}", height=90)
                 ok = st.form_submit_button("💾 Simpan RTUP ini")
             if ok:
                 for i in ids:
