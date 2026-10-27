@@ -17,8 +17,10 @@ Fitur:
 
 Jalankan:  streamlit run app.py
 """
+import html as _html
 import io
 import json
+import math
 import re
 from datetime import datetime
 
@@ -184,6 +186,47 @@ def fmt_num(v, dec=0):
         return "-"
     s = f"{v:,.{dec}f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# ---------- tabel dengan teks wrap (tanpa scroll samping) ----------
+WRAP_CSS = ("<style>.wt{width:100%;border-collapse:collapse;font-size:.82rem}"
+            ".wt th,.wt td{border:1px solid rgba(128,128,128,.35);padding:4px 6px;vertical-align:top;"
+            "white-space:normal;overflow-wrap:anywhere;word-break:break-word;text-align:left}"
+            ".wt th{background:rgba(128,128,128,.18)}.wt td.c{white-space:nowrap}</style>")
+
+
+def esc(x):
+    return _html.escape(str(x if x is not None else "")).replace("\n", "<br>")
+
+
+def render_wrap(df: pd.DataFrame, key: str, widths: dict = None, size: int = 50):
+    """Tampilkan DataFrame sebagai tabel HTML yang teksnya otomatis turun baris (wrap), dengan paging."""
+    widths = widths or {}
+    n = len(df)
+    if n == 0:
+        st.info("Tidak ada data.")
+        return
+    npages = max(1, math.ceil(n / size))
+    pk = f"wrap_pg_{key}"
+    if npages > 1:
+        ss[pk] = min(max(1, int(ss.get(pk, 1))), npages)
+        c1, c2 = st.columns([1, 4])
+        page = c1.number_input("Halaman", min_value=1, max_value=npages, step=1, key=pk)
+        c2.caption(f"Baris {(page - 1) * size + 1}–{min(page * size, n)} dari {n:,} (halaman {page}/{npages})")
+    else:
+        page = 1
+    part = df.iloc[(page - 1) * size: page * size]
+
+    def _th(c):
+        w = f' style="width:{widths[c]}"' if c in widths else ""
+        return f"<th{w}>{esc(c)}</th>"
+
+    head = "".join(_th(c) for c in part.columns)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{esc(v)}</td>" for v in row) + "</tr>"
+        for row in part.itertuples(index=False, name=None))
+    st.markdown(WRAP_CSS + "<table class='wt'><thead><tr>" + head + "</tr></thead><tbody>" + body + "</tbody></table>",
+                unsafe_allow_html=True)
 
 
 class Ctx:
@@ -678,6 +721,7 @@ def prov_clear_widgets(ids=None):
 def prov_reset_input():
     ss.prov_just = {}
     prov_clear_widgets()
+    ss.pop("prov_loaded", None)
     ss.prov_ver += 1
     ss.toast = "Isian justifikasi direset."
 
@@ -687,6 +731,7 @@ def prov_reset_rtup(ids):
         ss.prov_just.pop(i, None)
     prov_clear_widgets(ids)
     ss.prov_ver += 1
+    ss["prov_full"] = True
     ss.toast = f"Isian {len(ids)} flag pada RTUP ini direset."
 
 
@@ -695,6 +740,8 @@ def prov_reset_all():
     ss.prov_gen += 1
     ss.prov_upv += 1
     ss["prov_paste"] = ""
+    ss.pop("prov_loaded", None)
+    ss.pop("prov_sel", None)
     ss.toast = "Template dan semua isian direset."
 
 
@@ -836,28 +883,32 @@ def render_prov_page():
 
     def save_rtup(ids, gen, sk_):
         """Simpan isian RTUP terpilih ke tabel (tanpa pindah tampilan)."""
+        pv = ss.prov_ver
         for i in ids:
-            s_ = ss.get(f"pst_{i}_{gen}", STATUS_PLACEHOLDER)
-            t_ = str(ss.get(f"ptx_{i}_{gen}_{sk_}", "")).strip()
+            s_ = ss.get(f"pst_{i}_{gen}_{pv}", STATUS_PLACEHOLDER)
+            t_ = str(ss.get(f"ptx_{i}_{gen}_{pv}_{sk_}", "")).strip()
             if s_ == STATUS_PLACEHOLDER:
                 ss.prov_just.pop(i, None)
             else:
                 ss.prov_just[i] = {"status": s_, "text": sync_text(ss.prov_df.loc[i], s_, t_)}
-        prov_clear_widgets(ids)          # isian dimuat ulang dari data tersimpan
-        ss.prov_ver += 1                 # hanya menyegarkan Mode tabel
+        prov_clear_widgets(ids)
+        ss.prov_ver += 1                 # kunci widget baru -> isian dimuat ulang dari data tersimpan
+        ss["prov_full"] = True           # muat ulang penuh agar ringkasan ikut diperbarui
         ss.toast = "RTUP tersimpan ke tabel."
 
     def apply_rtup(all_ids, gen, sk_, kap, kow):
         """Terapkan satu justifikasi ke semua flag pada RTUP terpilih saja."""
+        pv = ss.prov_ver
         stt, ow = ss[kap], ss[kow]
         n = 0
         for i in all_ids:
             if ow or not ss.prov_just.get(i, {}).get("status"):
-                cur = ss.get(f"ptx_{i}_{gen}_{sk_}", ss.prov_just.get(i, {}).get("text", ""))
+                cur = ss.get(f"ptx_{i}_{gen}_{pv}_{sk_}", ss.prov_just.get(i, {}).get("text", ""))
                 ss.prov_just[i] = {"status": stt, "text": sync_text(ss.prov_df.loc[i], stt, cur)}
                 n += 1
         prov_clear_widgets(all_ids)
         ss.prov_ver += 1
+        ss["prov_full"] = True
         ss.toast = f"{n} flag pada RTUP ini diset '{stt}' dan tersimpan."
 
     up = st.file_uploader("Unggah template provinsi (TXT / TSV / CSV / XLSX)", type=["txt", "tsv", "csv", "xlsx", "xls"], key=f"prov_up_{ss.prov_upv}")
@@ -878,6 +929,8 @@ def render_prov_page():
             ss.prov_sig, ss.prov_df, ss.prov_map = sig, d, M
             ss.prov_just, ss.prov_ver = {}, 0
             ss.prov_gen += 1
+            ss.pop("prov_loaded", None)
+            ss.pop("prov_sel", None)
     except Exception as e:
         st.error(f"Gagal membaca template: {e}")
 
@@ -937,54 +990,99 @@ def render_prov_page():
 
     # tampilan dipilih dengan radio bersimpan (bukan st.tabs) agar tidak kembali ke Mode tabel setiap ada perubahan
     view_sel = st.radio("Tampilan", VIEWS, horizontal=True, key="prov_view", label_visibility="collapsed")
+    if view_sel != VIEWS[1]:
+        ss.pop("prov_loaded", None)     # saat kembali ke Mode per RTUP, isian dimuat ulang dari data tersimpan
 
     # ---------------- MODE TABEL
+    _frag = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
     if view_sel == VIEWS[0]:
         st.caption(
-            f"{len(sub):,} baris tampil. Mode ini hanya untuk **edit langsung**: pilih **Justifikasi** dan ketik "
-            "**Penjelasan** di tabel, lalu klik Simpan. Tidak ada pengisian otomatis di sini; pengisian otomatis "
-            "dan 'Terapkan ke semua' hanya ada di tab *Mode per RTUP* dan hanya untuk RTUP terpilih."
+            f"{len(sub):,} baris sesuai filter. Tabel dibuat **wrap** (tanpa scroll samping) untuk mengecek; "
+            "bila perlu mengubah, buka **✏️ Edit langsung**. Tidak ada pengisian otomatis di sini; pengisian "
+            "otomatis dan 'Terapkan ke semua' hanya ada di *Mode per RTUP* dan hanya untuk RTUP terpilih."
         )
-        view = pd.DataFrame(index=sub.index)
-        view["Nama KRT"] = sub[M["krt"]] if "krt" in M else ""
-        view["Kode"] = sub["_kode"]
-        view["Rincian"] = sub[M["rincian"]] if "rincian" in M else ""
-        view["Variabel & nilai"] = sub[M["var"]] if "var" in M else ""
-        view["Deskripsi anomali"] = sub[M["deskripsi"]] if "deskripsi" in M else ""
-        view["Catatan (petugas)"] = sub[M["catatan"]] if "catatan" in M else ""
-        if "link" in M:
-            view["Link edit"] = [edit_link(get(df.loc[i], "link"), survey_id) for i in sub.index]
-        view["Justifikasi"] = [ss.prov_just.get(i, {}).get("status", STATUS_PLACEHOLDER) for i in sub.index]
-        view["Penjelasan"] = [ss.prov_just.get(i, {}).get("text", "") for i in sub.index]
-        ed = st.data_editor(
-            view, key=f"pted_{ver}",
-            disabled=[c for c in view.columns if c not in ("Justifikasi", "Penjelasan")],
-            column_config={"Justifikasi": st.column_config.SelectboxColumn(options=STATUS_OPTS, required=True),
-                           "Link edit": st.column_config.LinkColumn("Link edit", display_text="✏️ Edit"),
-                           "Penjelasan": st.column_config.TextColumn(width="large")},
-        )
-        if st.button("💾 Simpan tabel", key=f"ptsave_{ver}"):
-            n = 0
-            for i in ed.index:
-                s_ = ed.at[i, "Justifikasi"]
-                t_ = str(ed.at[i, "Penjelasan"] or "").strip()
-                old = ss.prov_just.get(i)
-                if s_ and s_ != STATUS_PLACEHOLDER:
-                    new = {"status": s_, "text": t_}      # disimpan apa adanya, tanpa isian otomatis
-                    if old != new:
-                        ss.prov_just[i] = new
+        pc1, pc2, pc3 = st.columns([1, 1, 3])
+        psize = pc1.selectbox("Baris per halaman", [25, 50, 100], index=1, key="ptsize")
+        npages = max(1, math.ceil(len(sub) / psize))
+        ss["ptpage"] = min(max(1, int(ss.get("ptpage", 1))), npages)
+        page = pc2.number_input("Halaman", min_value=1, max_value=npages, step=1, key="ptpage")
+        lo_, hi_ = (page - 1) * psize, min(page * psize, len(sub))
+        pc3.caption(f"Baris {lo_ + 1 if len(sub) else 0}–{hi_} dari {len(sub):,} (halaman {page}/{npages})")
+        sub_p = sub.iloc[lo_:hi_]
+
+        J_LBL = {"Diperbaiki": "🛠️ Diperbaiki", "Sesuai Kondisi Lapangan": "✅ Sesuai Kondisi Lapangan",
+                 "Non Respon": "🚫 Non Respon"}
+        heads = [("Baris", ""), ("Nama KRT", ""), ("Kode", ""), ("Rincian", ""), ("Variabel &amp; nilai", ""),
+                 ("Deskripsi anomali", ""), ("Catatan petugas", ' style="width:16%"'),
+                 ("Justifikasi", ' style="width:9%"'), ("Penjelasan", ' style="width:30%"')]
+        rows_html = []
+        for i in sub_p.index:
+            r = df.loc[i]
+            j = ss.prov_just.get(i)
+            lk = get(r, "link")
+            edit = (f' <a href="{_html.escape(edit_link(lk, survey_id))}" target="_blank" rel="noopener noreferrer">✏️</a>'
+                    if lk.startswith("http") else "")
+            jst = esc(J_LBL.get(j["status"], j["status"])) if j else "—"
+            jtx = esc(j["text"]) if j else ""
+            rows_html.append(
+                "<tr>"
+                f"<td class='c'>{i + 2}</td>"
+                f"<td>{esc(get(r, 'krt'))}{edit}</td>"
+                f"<td class='c'>{esc(r['_kode'])}</td>"
+                f"<td>{esc(get(r, 'rincian'))}</td>"
+                f"<td>{esc(get(r, 'var'))}</td>"
+                f"<td>{esc(get(r, 'deskripsi'))}</td>"
+                f"<td>{esc(get(r, 'catatan'))}</td>"
+                f"<td>{jst}</td>"
+                f"<td>{jtx}</td>"
+                "</tr>")
+        if not rows_html:
+            st.info("Tidak ada baris pada filter ini.")
+        else:
+            thead = "".join(f"<th{w}>{h}</th>" for h, w in heads)
+            st.markdown(WRAP_CSS + "<table class='wt'><thead><tr>" + thead + "</tr></thead><tbody>"
+                        + "".join(rows_html) + "</tbody></table>", unsafe_allow_html=True)
+
+        with st.expander("✏️ Edit langsung (baris pada halaman ini)"):
+            st.caption("Pilih **Justifikasi** dan ketik **Penjelasan**, lalu klik Simpan. Kolom di sini tidak wrap; "
+                       "gunakan tabel di atas untuk mengecek.")
+            ev = pd.DataFrame(index=sub_p.index)
+            ev["Nama KRT"] = sub_p[M["krt"]] if "krt" in M else ""
+            ev["Kode"] = sub_p["_kode"]
+            ev["Rincian"] = sub_p[M["rincian"]] if "rincian" in M else ""
+            ev["Justifikasi"] = [ss.prov_just.get(i, {}).get("status", STATUS_PLACEHOLDER) for i in sub_p.index]
+            ev["Penjelasan"] = [ss.prov_just.get(i, {}).get("text", "") for i in sub_p.index]
+            ed = st.data_editor(
+                ev, key=f"pted_{ver}_{page}_{psize}",
+                disabled=[c for c in ev.columns if c not in ("Justifikasi", "Penjelasan")],
+                column_config={"Justifikasi": st.column_config.SelectboxColumn(options=STATUS_OPTS, required=True),
+                               "Penjelasan": st.column_config.TextColumn(width="large")},
+            )
+            if st.button("💾 Simpan tabel", key=f"ptsave_{ver}_{page}_{psize}"):
+                n = 0
+                for i in ed.index:
+                    s_ = ed.at[i, "Justifikasi"]
+                    t_ = str(ed.at[i, "Penjelasan"] or "").strip()
+                    old = ss.prov_just.get(i)
+                    if s_ and s_ != STATUS_PLACEHOLDER:
+                        new = {"status": s_, "text": t_}      # disimpan apa adanya, tanpa isian otomatis
+                        if old != new:
+                            ss.prov_just[i] = new
+                            n += 1
+                    elif old is not None:
+                        ss.prov_just.pop(i)
                         n += 1
-                elif old is not None:
-                    ss.prov_just.pop(i)
-                    n += 1
-            ss.toast = f"Tabel tersimpan ({n} baris berubah)."
-            ss.prov_ver += 1
-            st.rerun()
+                ss.toast = f"Tabel tersimpan ({n} baris berubah)."
+                ss.prov_ver += 1
+                st.rerun()
 
     # ---------------- MODE PER RTUP
     if view_sel == VIEWS[1]:
+        ss.pop("prov_full", None)
         st.caption("Pilih **Justifikasi** pada tiap flag: penjelasan default langsung terisi sesuai justifikasi. "
-                   "Perubahan baru masuk ke tabel setelah klik **Simpan RTUP ini**; tampilan tidak berpindah.")
+                   "Perubahan baru masuk ke tabel setelah klik **Simpan RTUP ini**. "
+                   "Isian yang belum disimpan akan dibuang saat pindah RTUP, dan RTUP yang dipilih selalu "
+                   "dimuat sesuai data tersimpan.")
         with st.expander("🧩 Atur template catatan default (opsional)"):
             st.markdown("**Sesuai Kondisi Lapangan**")
             st.text_area("Template tanpa nilai", key="prov_tpl_no", height=100)
@@ -1001,80 +1099,113 @@ def render_prov_page():
         if not groups:
             st.info("Tidak ada RTUP pada filter ini.")
         else:
+            all_by_aid = {a: g.index.tolist() for a, g in df.groupby("_aid", sort=False)}
+            opts_rt = list(groups)
+            krt_c = df[M["krt"]] if "krt" in M else None
+            desa_c = df[M["desa"]] if "desa" in M else None
+
             def lbl(a):
                 ids_ = groups[a]
                 d = sum(1 for i in ids_ if stat(i))
-                r0_ = df.loc[ids_[0]]
-                return f"{'✅' if d == len(ids_) else '⏳'} {get(r0_, 'krt') or a} · {get(r0_, 'desa')} · {len(ids_)} flag ({d} selesai)"
+                nm = krt_c.at[ids_[0]] if krt_c is not None else ""
+                ds = desa_c.at[ids_[0]] if desa_c is not None else ""
+                return f"{'✅' if d == len(ids_) else '⏳'} {nm or a} · {ds} · {len(ids_)} flag ({d} selesai)"
 
-            # pilihan RTUP diingat sendiri agar tidak kembali ke RTUP pertama setelah menyimpan
-            opts_rt = list(groups)
-            cur_rt = ss.get("prov_sel")
-            sel = st.selectbox("Pilih RTUP (ketik untuk mencari)", opts_rt,
-                               index=opts_rt.index(cur_rt) if cur_rt in opts_rt else 0, format_func=lbl)
-            ss["prov_sel"] = sel
-            ids = groups[sel]
-            r0 = df.loc[ids[0]]
-            all_ids = df.index[df["_aid"] == sel].tolist()      # hanya baris milik RTUP terpilih
-            st.markdown(
-                f"**{get(r0, 'krt')}** — {get(r0, 'kab')} / {get(r0, 'kec')} / {get(r0, 'desa')} / {get(r0, 'sls')} "
-                f"· ART: {get(r0, 'jml_art')} · PPL: {get(r0, 'ppl')} · PML: {get(r0, 'pml')}"
-            )
-            if "krt" in M and df.loc[all_ids, M["krt"]].nunique() > 1:
-                st.warning("Beberapa nama KRT berbeda terbaca sebagai satu RTUP. Periksa kolom Link pada template "
-                           "sebelum memakai 'Terapkan ke semua'.")
-            if get(r0, "link").startswith("http"):
-                lb1, lb2, _ = st.columns([1, 1, 2])
-                lb1.link_button("✏️ Buka mode edit di FASIH SM", edit_link(get(r0, "link"), survey_id), type="primary")
-                lb2.link_button("🔗 Buka detail", get(r0, "link"))
+            def on_sel():
+                ss["prov_sel"] = ss.get("prov_sel_w")
 
-            st.markdown("**Terapkan justifikasi ke semua flag pada RTUP ini**")
-            st.caption(f"Hanya berlaku untuk RTUP terpilih ({len(all_ids)} flag), bukan seluruh baris template.")
-            ap1, ap2, ap3 = st.columns([2, 2, 1])
-            kap, kow = f"aps_{sel}_{gen}", f"apo_{sel}_{gen}"
-            ap1.selectbox("Pilih justifikasi", STATUS_OPTS[1:], index=1, key=kap)
-            ap2.checkbox("Ganti juga flag yang sudah terisi", value=True, key=kow,
-                         help="Penjelasan yang Anda tulis sendiri dipertahankan; hanya penjelasan default yang disesuaikan.")
-            ap3.write("")
-            ap3.button("Terapkan ke semua", key=f"apb_{sel}_{gen}", on_click=apply_rtup,
-                       args=(all_ids, gen, sk, kap, kow))
-            st.button("🔄 Reset RTUP ini", on_click=prov_reset_rtup, args=(all_ids,), key=f"prrst_{sel}_{gen}",
-                      help="Mengosongkan justifikasi dan penjelasan semua flag pada RTUP ini. RTUP lain tidak terpengaruh.")
+            def rt_view():
+                # setelah simpan/terapkan/reset: muat ulang seluruh halaman agar angka ringkasan ikut diperbarui
+                if _frag and ss.pop("prov_full", False):
+                    st.rerun()
+                _m = ss.get("toast")
+                if _m:
+                    ss["toast"] = None
+                    st.toast(_m)
+                pv = ss.prov_ver
 
-            # tanpa st.form agar pilihan justifikasi langsung memicu pengisian penjelasan
-            for i in ids:
-                r = df.loc[i]
-                st.markdown(f"**{r['_kode']}** · {get(r, 'blok')} {get(r, 'rincian')} — {get(r, 'deskripsi')}")
-                st.text(f"Variabel: {get(r, 'var')}   |   Kondisi: {get(r, 'kondisi')}")
-                st.text(f"Catatan petugas: {get(r, 'catatan')}")
-                sv = ss.prov_just.get(i, {})
-                kst, ktx = f"pst_{i}_{gen}", f"ptx_{i}_{gen}_{sk}"
-                if kst not in ss:
-                    ss[kst] = sv.get("status", STATUS_PLACEHOLDER)
-                if ktx not in ss:
-                    ss[ktx] = sv["text"] if sv else (auto(r, ss[kst]) if ss[kst] != STATUS_PLACEHOLDER else "")
-                a, b = st.columns([1, 2])
-                a.selectbox("Justifikasi", STATUS_OPTS, key=kst, on_change=on_status, args=(i, kst, ktx))
-                b.text_area("Penjelasan", key=ktx, height=110,
-                            placeholder="Pilih justifikasi: penjelasan default akan terisi otomatis.")
+                # pilihan RTUP: key tetap (identitas widget stabil) + nilai dipulihkan dari penyimpanan sendiri
+                keep = ss.get("prov_sel")
+                if keep not in opts_rt:
+                    keep = opts_rt[0]
+                    ss["prov_sel"] = keep
+                ss["prov_sel_w"] = keep
+                sel = st.selectbox("Pilih RTUP (ketik untuk mencari)", opts_rt, key="prov_sel_w",
+                                   format_func=lbl, on_change=on_sel)
+                ss["prov_sel"] = sel
+                ids = groups[sel]
+                r0 = df.loc[ids[0]]
+                all_ids = all_by_aid.get(sel, ids)      # hanya baris milik RTUP terpilih
 
-            def _saved(i):
-                j = ss.prov_just.get(i)
-                return (j["status"], j["text"]) if j else (STATUS_PLACEHOLDER, "")
+                # RTUP baru dipilih -> buang isian widget lama agar langsung dimuat dari data tersimpan
+                tag = (sel, pv, gen)
+                if ss.get("prov_loaded") != tag:
+                    prov_clear_widgets(all_ids)
+                    ss["prov_loaded"] = tag
 
-            dirty = any((ss[f"pst_{i}_{gen}"], str(ss[f"ptx_{i}_{gen}_{sk}"]).strip()) != _saved(i) for i in ids)
-            sv1, sv2 = st.columns([1, 3])
-            sv1.button("💾 Simpan RTUP ini", key=f"prsave_{sel}_{gen}", type="primary",
-                       on_click=save_rtup, args=(ids, gen, sk))
-            sv2.caption("⚠️ Ada perubahan yang belum disimpan." if dirty else "✅ Semua perubahan RTUP ini sudah tersimpan.")
+                st.markdown(
+                    f"**{get(r0, 'krt')}** — {get(r0, 'kab')} / {get(r0, 'kec')} / {get(r0, 'desa')} / {get(r0, 'sls')} "
+                    f"· ART: {get(r0, 'jml_art')} · PPL: {get(r0, 'ppl')} · PML: {get(r0, 'pml')}"
+                )
+                if "krt" in M and df.loc[all_ids, M["krt"]].nunique() > 1:
+                    st.warning("Beberapa nama KRT berbeda terbaca sebagai satu RTUP. Periksa kolom Link pada template "
+                               "sebelum memakai 'Terapkan ke semua'.")
+                if get(r0, "link").startswith("http"):
+                    lb1, lb2, _ = st.columns([1, 1, 2])
+                    lb1.link_button("✏️ Buka mode edit di FASIH SM", edit_link(get(r0, "link"), survey_id), type="primary")
+                    lb2.link_button("🔗 Buka detail", get(r0, "link"))
 
-            lines = [prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"])
-                     for i in ids if i in ss.prov_just]
-            st.markdown("**Teks untuk Blok Catatan Anomali (FASIH SM)**")
-            if lines:
-                st.code("\n".join(lines), language=None)
-            else:
-                st.caption("Belum ada justifikasi tersimpan.")
+                st.markdown("**Terapkan justifikasi ke semua flag pada RTUP ini**")
+                st.caption(f"Hanya berlaku untuk RTUP terpilih ({len(all_ids)} flag), bukan seluruh baris template.")
+                ap1, ap2, ap3 = st.columns([2, 2, 1])
+                kap, kow = f"aps_{sel}_{gen}", f"apo_{sel}_{gen}"
+                ap1.selectbox("Pilih justifikasi", STATUS_OPTS[1:], index=1, key=kap)
+                ap2.checkbox("Ganti juga flag yang sudah terisi", value=True, key=kow,
+                             help="Penjelasan yang Anda tulis sendiri dipertahankan; hanya penjelasan default yang disesuaikan.")
+                ap3.write("")
+                ap3.button("Terapkan ke semua", key=f"apb_{sel}_{gen}", on_click=apply_rtup,
+                           args=(all_ids, gen, sk, kap, kow))
+                st.button("🔄 Reset RTUP ini", on_click=prov_reset_rtup, args=(all_ids,), key=f"prrst_{sel}_{gen}",
+                          help="Mengosongkan justifikasi dan penjelasan semua flag pada RTUP ini. RTUP lain tidak terpengaruh.")
+
+                # tanpa st.form agar pilihan justifikasi langsung memicu pengisian penjelasan
+                for i in ids:
+                    r = df.loc[i]
+                    st.markdown(f"**{r['_kode']}** · {get(r, 'blok')} {get(r, 'rincian')} — {get(r, 'deskripsi')}")
+                    st.text(f"Variabel: {get(r, 'var')}   |   Kondisi: {get(r, 'kondisi')}")
+                    st.text(f"Catatan petugas: {get(r, 'catatan')}")
+                    sv = ss.prov_just.get(i, {})
+                    kst, ktx = f"pst_{i}_{gen}_{pv}", f"ptx_{i}_{gen}_{pv}_{sk}"
+                    if kst not in ss:
+                        ss[kst] = sv.get("status", STATUS_PLACEHOLDER)
+                    if ktx not in ss:
+                        ss[ktx] = sv["text"] if sv else (auto(r, ss[kst]) if ss[kst] != STATUS_PLACEHOLDER else "")
+                    a, b = st.columns([1, 2])
+                    a.selectbox("Justifikasi", STATUS_OPTS, key=kst, on_change=on_status, args=(i, kst, ktx))
+                    b.text_area("Penjelasan", key=ktx, height=110,
+                                placeholder="Pilih justifikasi: penjelasan default akan terisi otomatis.")
+
+                def _saved(i):
+                    j = ss.prov_just.get(i)
+                    return (j["status"], j["text"]) if j else (STATUS_PLACEHOLDER, "")
+
+                dirty = any((ss[f"pst_{i}_{gen}_{pv}"], str(ss[f"ptx_{i}_{gen}_{pv}_{sk}"]).strip()) != _saved(i)
+                            for i in ids)
+                sv1, sv2 = st.columns([1, 3])
+                sv1.button("💾 Simpan RTUP ini", key=f"prsave_{sel}_{gen}", type="primary",
+                           on_click=save_rtup, args=(ids, gen, sk))
+                sv2.caption("⚠️ Ada perubahan yang belum disimpan." if dirty else "✅ Semua perubahan RTUP ini sudah tersimpan.")
+
+                lines = [prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"])
+                         for i in ids if i in ss.prov_just]
+                st.markdown("**Teks untuk Blok Catatan Anomali (FASIH SM)**")
+                if lines:
+                    st.code("\n".join(lines), language=None)
+                else:
+                    st.caption("Belum ada justifikasi tersimpan.")
+
+            # fragment: memilih RTUP / mengganti justifikasi hanya menjalankan ulang bagian ini (jauh lebih cepat)
+            (_frag(rt_view) if _frag else rt_view)()
 
     # ---------------- HASIL
     if view_sel == VIEWS[2]:
@@ -1101,7 +1232,7 @@ def render_prov_page():
         else:
             st.success("Semua baris sudah terisi lengkap. ✅")
         with st.expander(f"Validasi ({len(iss)})", expanded=bool(n_block)):
-            st.dataframe(iss)
+            render_wrap(iss, key="prov_iss", widths={"Catatan": "60%"}, size=100)
 
         out = df.drop(columns=["_aid", "_kode"]).copy()
         ket = M.get("ket", "Keterangan Perbaikan/kode flag")
@@ -1127,10 +1258,25 @@ def render_prov_page():
                 "catatan_anomali": "\n".join(prov_note(df.at[i, "_kode"], ss.prov_just[i]["status"], ss.prov_just[i]["text"]) for i in d),
             })
         cat = pd.DataFrame(rows)
+
         st.subheader("Catatan anomali per RTUP (siap tempel ke FASIH SM)")
-        st.dataframe(cat)
-        st.subheader("Template terisi")
-        st.dataframe(out)
+        render_wrap(
+            cat[["nama_krt", "desa", "ppl", "jumlah_flag", "selesai", "status", "catatan_anomali"]],
+            key="prov_cat", widths={"catatan_anomali": "50%"}, size=30)
+
+        st.subheader("Template terisi (pratinjau)")
+        prev = pd.DataFrame({
+            "Baris": [i + 2 for i in df.index],
+            "Nama KRT": [get(df.loc[i], "krt") for i in df.index],
+            "Kode": df["_kode"].values,
+            "Rincian": [get(df.loc[i], "rincian") for i in df.index],
+            "Justifikasi": [ss.prov_just.get(i, {}).get("status", "") for i in df.index],
+            "Penjelasan": [ss.prov_just.get(i, {}).get("text", "") for i in df.index],
+        })
+        render_wrap(prev, key="prov_prev", widths={"Penjelasan": "45%"}, size=50)
+        with st.expander("Lihat template lengkap (semua kolom, bisa scroll samping)"):
+            st.dataframe(out)
+
         d1, d2, d3 = st.columns(3)
         d1.download_button(
             "📥 Excel (template terisi + catatan per RTUP)",
@@ -1422,7 +1568,7 @@ with tab_review:
                     "⚠️ Masih terdeteksi" if (sel, k) in set_now else "✅ Tidak terdeteksi lagi" for k in g["kode"]
                 ],
             })
-            st.dataframe(tbl)
+            render_wrap(tbl, key=f"flags_{sel}", widths={"Deskripsi": "45%"}, size=100)
 
         # ---- B. edit data
         st.markdown("#### ① Perbaiki data (sesuai hasil konfirmasi)")
@@ -1538,7 +1684,7 @@ with tab_out:
         st.info("Belum ada data.")
     else:
         st.metric("RTUP lengkap", f"{(cat_df['status'] == 'Lengkap').sum()} / {len(cat_df)}")
-        st.dataframe(cat_df)
+        render_wrap(cat_df, key="main_cat", widths={"catatan_anomali": "50%"}, size=30)
 
     log_df = pd.DataFrame(ss.log, columns=["waktu", "id", "baris", "kolom", "nilai_lama", "nilai_baru"])
     flag_out = flags0.drop(columns=["rows"]).copy()
@@ -1595,6 +1741,8 @@ Untuk anomali/outlier yang dilakukan mandiri oleh BPS Provinsi: `#B_[Nomor anoma
 """
     )
     st.subheader("Daftar anomali")
-    st.dataframe(pd.DataFrame({"Kode": list(ANOMALI_DESC), "Deskripsi": list(ANOMALI_DESC.values())}))
+    render_wrap(pd.DataFrame({"Kode": list(ANOMALI_DESC), "Deskripsi": list(ANOMALI_DESC.values())}),
+                key="guide_a", widths={"Deskripsi": "85%"}, size=100)
     st.subheader("Daftar outlier")
-    st.dataframe(pd.DataFrame({"Kode": list(OUTLIER_DESC), "Deskripsi": list(OUTLIER_DESC.values())}))
+    render_wrap(pd.DataFrame({"Kode": list(OUTLIER_DESC), "Deskripsi": list(OUTLIER_DESC.values())}),
+                key="guide_o", widths={"Deskripsi": "85%"}, size=100)
