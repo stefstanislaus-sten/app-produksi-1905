@@ -761,6 +761,11 @@ def prov_prepare(df: pd.DataFrame):
         return "|".join(df.at[i, M[k]] for k in ("krt", "sls", "desa") if k in M) or f"baris{i}"
 
     df["_aid"] = [aid(i) for i in df.index]
+    # pengaman: bila satu ID memuat beberapa nama KRT berbeda (ID tidak unik per RTUP), pisahkan per nama KRT
+    if "krt" in M:
+        clash = df.groupby("_aid")[M["krt"]].transform("nunique") > 1
+        if clash.any():
+            df.loc[clash, "_aid"] = df.loc[clash, "_aid"] + "|" + df.loc[clash, M["krt"]].str.lower()
     df["_kode"] = df[M["kode"]].map(norm_kode) if "kode" in M else ""
     return df, M
 
@@ -909,37 +914,11 @@ def render_prov_page():
 
     # ---------------- MODE TABEL
     with t_tab:
-        st.caption(f"{len(sub):,} baris tampil. Pilih **Justifikasi** dan isi **Penjelasan**, lalu klik Simpan. "
-                   "Cara pengisian penjelasan otomatis diatur di tab *Mode per RTUP*.")
-        with st.expander("👁️ Pratinjau catatan default (3 baris pertama pada filter)"):
-            for i in sub.index[:3]:
-                st.caption(f"{df.at[i, '_kode']} · {get(df.loc[i], 'krt')}")
-                st.markdown("_Sesuai Kondisi Lapangan_")
-                st.code(auto(df.loc[i]) or "(kosong)", language=None)
-                st.markdown("_Diperbaiki_")
-                st.code(auto(df.loc[i], "Diperbaiki") or "(kosong)", language=None)
-        b1, b2, b3 = st.columns([2, 2, 1])
-        bulk = b1.selectbox("Isi massal baris terfilter yang belum diisi", STATUS_OPTS[1:], index=1, key=f"bulk_{ver}")
-        b2.caption("Penjelasan diisi sesuai mode otomatis (default: template catatan). Periksa dulu sebelum dipakai.")
-        if b3.button("Terapkan", key=f"bulkb_{ver}"):
-            n = 0
-            for i in sub.index:
-                if not stat(i):
-                    ss.prov_just[i] = {"status": bulk, "text": auto(df.loc[i], bulk)}
-                    n += 1
-            ss.prov_ver += 1
-            ss.prov_flash = f"{n} baris diisi '{bulk}'."
-            st.rerun()
-        if st.button("✍️ Isi penjelasan yang masih kosong (baris terfilter yang sudah punya justifikasi)", key=f"fillb_{ver}"):
-            n = 0
-            for i in sub.index:
-                j = ss.prov_just.get(i)
-                if j and not j["text"]:
-                    j["text"] = auto(df.loc[i], j["status"])
-                    n += 1
-            ss.prov_ver += 1
-            ss.prov_flash = f"{n} penjelasan diisi."
-            st.rerun()
+        st.caption(
+            f"{len(sub):,} baris tampil. Mode ini hanya untuk **edit langsung**: pilih **Justifikasi** dan ketik "
+            "**Penjelasan** di tabel, lalu klik Simpan. Tidak ada pengisian otomatis di sini; pengisian otomatis "
+            "dan 'Terapkan ke semua' hanya ada di tab *Mode per RTUP* dan hanya untuk RTUP terpilih."
+        )
         view = pd.DataFrame(index=sub.index)
         view["Nama KRT"] = sub[M["krt"]] if "krt" in M else ""
         view["Kode"] = sub["_kode"]
@@ -950,25 +929,29 @@ def render_prov_page():
         if "link" in M:
             view["Link edit"] = [edit_link(get(df.loc[i], "link"), survey_id) for i in sub.index]
         view["Justifikasi"] = [ss.prov_just.get(i, {}).get("status", STATUS_PLACEHOLDER) for i in sub.index]
-        view["Penjelasan"] = [
-            ss.prov_just[i]["text"] if i in ss.prov_just else (auto(df.loc[i]))
-            for i in sub.index
-        ]
+        view["Penjelasan"] = [ss.prov_just.get(i, {}).get("text", "") for i in sub.index]
         ed = st.data_editor(
-            view, key=f"pted_{ver}_{sk}",
+            view, key=f"pted_{ver}",
             disabled=[c for c in view.columns if c not in ("Justifikasi", "Penjelasan")],
             column_config={"Justifikasi": st.column_config.SelectboxColumn(options=STATUS_OPTS, required=True),
                            "Link edit": st.column_config.LinkColumn("Link edit", display_text="✏️ Edit"),
                            "Penjelasan": st.column_config.TextColumn(width="large")},
         )
         if st.button("💾 Simpan tabel", key=f"ptsave_{ver}"):
+            n = 0
             for i in ed.index:
                 s_ = ed.at[i, "Justifikasi"]
+                t_ = str(ed.at[i, "Penjelasan"] or "").strip()
+                old = ss.prov_just.get(i)
                 if s_ and s_ != STATUS_PLACEHOLDER:
-                    ss.prov_just[i] = {"status": s_, "text": sync_text(df.loc[i], s_, str(ed.at[i, "Penjelasan"] or ""))}
-                else:
-                    ss.prov_just.pop(i, None)
-            ss.prov_flash = "Tabel tersimpan."
+                    new = {"status": s_, "text": t_}      # disimpan apa adanya, tanpa isian otomatis
+                    if old != new:
+                        ss.prov_just[i] = new
+                        n += 1
+                elif old is not None:
+                    ss.prov_just.pop(i)
+                    n += 1
+            ss.prov_flash = f"Tabel tersimpan ({n} baris berubah)."
             ss.prov_ver += 1
             st.rerun()
 
