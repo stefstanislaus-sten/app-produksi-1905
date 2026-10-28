@@ -1,5 +1,5 @@
 streamlit>=1.37
-pandas>=2.0
+pandas>=3.1.0
 numpy
 openpyxl
 pyarrow
